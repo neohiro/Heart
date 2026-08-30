@@ -1,0 +1,168 @@
+# Canonical /Heart + /Mouth + /Brain (//mind + //intuition) compose.
+# Embed this in the tailscale device stack.
+#
+# Storage model:
+#   /activememory  — bind-mounted from the device root (persistent, host-visible).
+#                    All three containers read/write this same path. Owned by
+#                    the host; the operator can `ls /activememory/heartbeat/`
+#                    from the device shell.
+#
+#   /Brain         — sub-tree of /activememory used as the entity/intelligence
+#                    store. Mind (//mind) and Intuition (//intuition) write here.
+#                    //mind and //intuition live in the same brain container
+#                    (sibling modules, supervised together).
+#
+#   /Heart         — sub-tree of /activememory used for the cadence engine.
+#                    Heart is the only writer. Mouth and Brain read.
+#
+#   /Mouth         — sub-tree of /activememory used for the LLM/voice layer.
+#                    Mouth writes its own output; reads Heart pokes, Brain state.
+#
+# Per-service permission contract:
+#   heart  : rw on /activememory (sole writer of /heart/ sub-tree)
+#   brain  : rw on /activememory (//mind + //intuition write /brain/ sub-tree)
+#   mouth  : ro on /activememory (reader only)
+#
+# Trigger path (Heart → Mouth):
+#   /activememory/heart/heartbeat/poke.json  ← Heart writes atomic
+#   Mouth's poke-listener fs.watch()s this file and reads its content.
+#
+# Build paths assume this file lives at the WORKSPACE root, alongside
+# `Brain/`, `Heart/`, `Mouth/` directories.
+#
+# Prerequisite: host must have `/activememory/` bind-mounted from device
+# storage and `secrets/brain_gh_token.txt` populated. See README for
+# bootstrap steps.
+
+services:
+  heart-init:
+    # Creates the required /activememory sub-tree on first start.
+    # Docker does not auto-create bind-mount subdirectories.
+    image: alpine:3.20
+    user: root
+    command: ["sh", "-c", "mkdir -p /data/heart/heartbeat /data/heart/audit /data/heart/reminders /data/brain/_entities /data/brain/config /data/mouth/outbox /data/mouth/errors /data/mouth/replies && chown -R 65532:65532 /data/heart /data/brain /data/mouth && echo 'initialized'"]
+    volumes:
+      - /activememory:/data
+    restart: "no"
+
+  heart:
+    build: ./Heart
+    restart: unless-stopped
+    user: "65532:65532"
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /run
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      HEART_BRAIN_PATH: /activememory/brain
+      HEART_HEART_PATH: /activememory/heart
+      HEART_MOUTH_PATH: /activememory/mouth
+      HEART_LOG_LEVEL: info
+      GH_TOKEN: ${GH_TOKEN}
+    volumes:
+      - /activememory:/activememory:rw
+    healthcheck:
+      test: ["CMD", "test", "-f", "/activememory/heart/heartbeat/last_run.yaml"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    depends_on:
+      heart-init:
+        condition: service_completed_successfully
+
+  brain:
+    # //mind + //intuition. The brain container runs both modules under
+    # one supervisor: //mind serves the admin + mouth APIs on 8080/8081,
+    # //intuition runs the deterministic deliberation gate on 8083.
+    # Both share /activememory/brain/ as their write surface.
+    image: node:20-alpine
+    hostname: brain
+    container_name: brain
+    restart: unless-stopped
+    user: "65532:65532"
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /run
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      NODE_ENV: production
+      BRAIN_PORT_ADMIN: 8080
+      BRAIN_PORT_API: 8081
+      INTUITION_PORT: 8083
+      INTUITION_THRESHOLD: "0.75"
+      INTUITION_LOG_LEVEL: info
+      BRAIN_PATH: /activememory/brain
+      BRAIN_DB_PATH: /activememory/brain/memory.db
+      BRAIN_GITHUB_TOKEN_FILE: /run/secrets/brain_gh_token
+      BRAIN_MOUTH_SOCKET: /activememory/mouth/mouth.sock
+    secrets:
+      - brain_gh_token
+    volumes:
+      - /activememory:/activememory:rw
+      - /var/run/tailscale:/var/run/tailscale:ro
+      - ./Brain/src:/app/src:ro
+    ports:
+      - "127.0.0.1:8080:8080"   # //mind admin — Tailscale only
+      - "127.0.0.1:8081:8081"   # //mind mouth API — internal only
+      - "127.0.0.1:8083:8083"   # //intuition deliberation API — internal
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    depends_on:
+      heart-init:
+        condition: service_completed_successfully
+      heart:
+        condition: service_healthy
+
+  mouth:
+    build: ./Mouth
+    hostname: mouth
+    container_name: mouth
+    restart: unless-stopped
+    user: "65532:65532"
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /run
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      MOUTH_BRAIN_PATH: /activememory/brain
+      MOUTH_HEART_PATH: /activememory/heart
+      MOUTH_LISTEN_PATH: /activememory/mouth/mouth.sock
+      MOUTH_HTTP_PORT: 8082
+      MOUTH_POKE_WATCH: /activememory/heart/heartbeat/poke.json
+      OPENCODE_SERVER: 0.0.0.0:4096
+      GH_TOKEN: ${GH_TOKEN}
+    volumes:
+      - /activememory:/activememory:ro
+      - /var/run/tailscale:/var/run/tailscale:ro
+    ports:
+      - "127.0.0.1:4096:4096"   # opencode serve (Tailscale only)
+    healthcheck:
+      test: ["CMD", "test", "-S", "/activememory/mouth/mouth.sock"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    depends_on:
+      brain:
+        condition: service_healthy
+      heart:
+        condition: service_healthy
+
+secrets:
+  brain_gh_token:
+    file: ./secrets/brain_gh_token.txt

@@ -1,0 +1,33 @@
+# Heart/.neohiro/heart.yaml
+#
+# Per-repo Heart steering manifest for neohiro/Heart.
+# Discovered by the Heart process at the body level per HEART_SCHEDULE_REGISTRY.md
+# ("Wire a new repo into /Heart's schedule + per-scope env/flags").
+#
+# Tells Heart that THIS repo is the authoritative cadence source for the
+# neohiro org. Without this, Heart would fall back to the org-wide scan and
+# might double-schedule the scopes declared in REGISTRY.yaml below.
+
+org: neohiro
+role: cadence-engine   # see AGENTS.md + HEART_SCHEDULE_REGISTRY.md
+
+# Heart reads schedule/REGISTRY.yaml from this path on every cycle.
+registry: schedules/REGISTRY.yaml
+
+# Per-scope environment overrides. Keys here take precedence over the
+# registry block of the same name.
+env_overrides:
+  NEOHIRO_SHARED_ROOT: "/shared"
+  NEOHIRO_LINKS_SECRET: "/links-secret"
+
+# Sentry hooks — Heart watches these for heartbeat liveness.
+heartbeat_targets:
+  - shared/brain/heartbeats/heart.neohiro.yaml
+  - shared/public/health/heart.json
+
+# Doctor escalation: any scraper/publisher that emits phase=scrape.degraded
+# more than 3 cycles in a row triggers abuse_bridge.py → /doctor page banner.
+doctor_escalation:
+  phase_pattern: "scrape.*|social.*"
+  threshold: 3
+  cooldown_minutes: 30

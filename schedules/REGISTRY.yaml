@@ -1,0 +1,93 @@
+---
+# Heart/schedules/REGISTRY.yaml — Per-scope registration for the
+# private-assistant tools, links, OSINT, and news populator scripts.
+# The Heart process reads this on every cycle and dispatches scripts
+# per the cadence keyword.
+#
+# STATUS: schema + scope registration. The referenced script files
+# (Heart/scripts/{news,osint,links-validate,tools}-populate/run.py)
+# are placeholders — to be implemented by a credentialed agent. Until
+# then, the `fallback_github_actions` cron is the effective cadence
+# (the live Heart at wingman-hub/.github/workflows/ runs the same
+# logical schedule).
+schema_version: 2
+last_updated: 2026-08-30
+
+# Scopes (one per script path). Each gets its own schedule.yaml
+# under Heart/schedules/<scope>/.
+scopes:
+  - id: news-populate
+    description: "Refresh news feed cache (HackerNews, Mastodon, Bluesky, GDELT, status RSS)."
+    path: Heart/scripts/news-populate/run.py
+    schedule: every_5_minutes
+    timeout_seconds: 60
+    retry_on_failure: true
+    max_retries: 2
+    fallback_github_actions: .github/workflows/news-fallback.yml
+    env: {}
+    flags: ["--quiet"]
+
+  - id: osint-populate
+    description: "Refresh OSINT cache (crt.sh, RDAP, BGP, threat intel)."
+    path: Heart/scripts/osint-populate/run.py
+    schedule: every_15_minutes
+    timeout_seconds: 120
+    retry_on_failure: true
+    max_retries: 2
+    fallback_github_actions: .github/workflows/osint-fallback.yml
+    env: {}
+    flags: ["--quiet"]
+
+  - id: links-validate
+    description: "Validate all public + private links; mark broken; resolve pending."
+    path: Heart/scripts/links-validate/run.py
+    schedule: every_60_minutes
+    timeout_seconds: 300
+    retry_on_failure: true
+    max_retries: 1
+    fallback_github_actions: .github/workflows/links-fallback.yml
+    env: {}
+    flags: ["--quiet"]
+
+  - id: tools-populate
+    description: "Refresh the PA tools catalog (re-emit tools.yaml from public-apis/n0shake diff)."
+    path: Heart/scripts/tools-populate/run.py
+    schedule: every_6_hours
+    timeout_seconds: 600
+    retry_on_failure: true
+    max_retries: 1
+    fallback_github_actions: .github/workflows/tools-fallback.yml
+    env: {}
+    flags: ["--quiet"]
+
+  - id: visitor-counter
+    description: "Scrape freevisitorcounters.com auth endpoints; publish worldmap datalayer + dashboard counters."
+    path: Heart/tools/visitor_counter_scraper.py
+    schedule: every_5_minutes
+    timeout_seconds: 30
+    retry_on_failure: true
+    max_retries: 2
+    fallback_github_actions: .github/workflows/visitor-counter-fallback.yml
+    env:
+      NEOHIRO_SHARED_ROOT: "/shared"
+      NEOHIRO_LINKS_SECRET: "/links-secret/visitor-counters.yaml"
+    flags: ["--quiet"]
+
+  - id: social-counter
+    description: "Poll YouTube/X/IG/Twitch for the public-facing Social Media Counters section."
+    path: Heart/tools/social_counter_poll.py
+    schedule: every_15_minutes
+    timeout_seconds: 60
+    retry_on_failure: true
+    max_retries: 2
+    fallback_github_actions: .github/workflows/social-counter-fallback.yml
+    env:
+      NEOHIRO_SHARED_ROOT: "/shared"
+      NEOHIRO_LINKS_SECRET: "/links-secret/social-counters.yaml"
+    flags: ["--quiet"]
+
+# Per-scope failure demotion
+failure_policy:
+  consecutive_failure_threshold_demote: 5     # demote to every_5_minutes
+  consecutive_failure_threshold_pause: 20     # pause; doctor dispatched
+  recover_after_demotion: true                # revert on next success

@@ -1,0 +1,20 @@
+---
+# Heart/schedules/links/schedule.yaml
+# Validate all public + private links every 1 hour.
+id: links-validate
+schedule: every_60_minutes
+timeout_seconds: 300
+retry_on_failure: true
+max_retries: 1
+run_on_startup: false
+fallback:
+  github_actions: .github/workflows/links-fallback.yml
+  cron: "0 * * * *"
+env: {}
+flags: ["--quiet"]
+notes: |
+  Walks links/feeds/*.yaml, links-secret/per-user/*/bookmarks.yaml,
+  and links-secret/per-page/*/*/*/private.yaml. HEAD-checks each
+  URL; on 4xx/5xx, marks the record `status: broken` and writes
+  to Brain/heartbeat/links_health.yaml. Resolves entries in
+  links/audit/pending.yaml.

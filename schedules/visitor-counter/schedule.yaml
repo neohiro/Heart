@@ -1,0 +1,42 @@
+# Heart/schedules/visitor-counter/schedule.yaml
+#
+# Per-scope schedule for Heart/schedules/REGISTRY.yaml -> visitor-counter.
+# See HEART_SCHEDULE_REGISTRY.md for the schema and Heart/SPEC.md for the
+# populator-script contract.
+
+scope: visitor-counter
+description: >
+  Scrape freevisitorcounters.com auth endpoints for every counter registered
+  in /links-secret/visitor-counters.yaml. Writes:
+    - /shared/worldmap/datalayers/visitors.json  (country-level datalayer)
+    - /shared/dashboard/counters/counters.json  (per-counter live totals)
+    - /shared/worldmap/feeds/visitor-events.ndjson  (append-only audit)
+
+schedule: every_5_minutes
+timeout_seconds: 30
+retry_on_failure: true
+max_retries: 2
+fallback_github_actions: .github/workflows/visitor-counter-fallback.yml
+env:
+  NEOHIRO_SHARED_ROOT: "/shared"
+  NEOHIRO_LINKS_SECRET: "/links-secret/visitor-counters.yaml"
+flags: ["--quiet"]
+
+# Output contracts — Heart validates these exist + are JSON before considering
+# the cycle successful. Schema details in neohiro-worldmap/SPEC_ADDENDUM.md § 1.
+outputs:
+  - path: /shared/worldmap/datalayers/visitors.json
+    schema: worldmap.datalayer.visitors
+    consumer: neohiro-worldmap (godadmin-only "visitors" layer)
+  - path: /shared/dashboard/counters/counters.json
+    schema: dashboard.counters.summary
+    consumer: neohiro-dashboard /api/visitor-counter (public)
+
+# Privacy posture: never store raw IPs, user agents, or referrers. Strip to
+# country ISO before writing any public artifact. If a future spec needs
+# city-level data, that field must be gated behind the visitors layer's
+# godadmin role check (see neohiro-worldmap/api/datalayers.js).
+privacy:
+  ip_storage: none
+  geo_granularity: country
+  retention_days: 30

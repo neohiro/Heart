@@ -1,0 +1,46 @@
+# Heart/.github/workflows/visitor-counter-fallback.yml
+#
+# GitHub Actions fallback for Heart/schedules/visitor-counter/schedule.yaml.
+# Runs every 5 minutes on cron + on manual dispatch. Pings the live Heart
+# process via a webhook so it knows the cron succeeded; on a quiet cycle
+# the live process is the source of truth.
+name: visitor-counter-fallback
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests pyyaml
+
+      - name: Run scraper
+        env:
+          NEOHIRO_LINKS_SECRET: ${{ secrets.NEOHIRO_LINKS_SECRET }}
+          NEOHIRO_SHARED_ROOT: /tmp/shared
+          RUN_ONCE: '1'
+        run: |
+          python Heart/tools/visitor_counter_scraper.py --quiet --once
+
+      - name: Notify Heart (best-effort)
+        if: always()
+        run: |
+          curl -fsS -m 5 -X POST \
+            -H "Authorization: Bearer ${{ secrets.HEART_WEBHOOK_TOKEN }}" \
+            "${{ secrets.HEART_WEBHOOK_URL }}/hooks/visitor-counter-fallback" \
+            -d "{\"conclusion\":\"${{ job.status }}\",\"run_id\":\"${{ github.run_id }}\"}" \
+            || echo "Heart webhook unreachable (non-fatal)"

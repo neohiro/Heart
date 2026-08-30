@@ -1,0 +1,40 @@
+# Heart/.github/workflows/social-counter-fallback.yml
+name: social-counter-fallback
+
+on:
+  schedule:
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+
+jobs:
+  poll:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests pyyaml
+
+      - name: Run social poller
+        env:
+          NEOHIRO_LINKS_SECRET: ${{ secrets.NEOHIRO_LINKS_SECRET }}
+          NEOHIRO_SHARED_ROOT: /tmp/shared
+        run: |
+          python Heart/tools/social_counter_poll.py --quiet --once
+
+      - name: Notify Heart
+        if: always()
+        run: |
+          curl -fsS -m 5 -X POST \
+            -H "Authorization: Bearer ${{ secrets.HEART_WEBHOOK_TOKEN }}" \
+            "${{ secrets.HEART_WEBHOOK_URL }}/hooks/social-counter-fallback" \
+            -d "{\"conclusion\":\"${{ job.status }}\",\"run_id\":\"${{ github.run_id }}\"}" \
+            || echo "Heart webhook unreachable (non-fatal)"

@@ -1,0 +1,19 @@
+---
+# Heart/schedules/tools/schedule.yaml
+# Refresh the private-assistant tools catalog every 6 hours.
+id: tools-populate
+schedule: every_6_hours
+timeout_seconds: 600
+retry_on_failure: true
+max_retries: 1
+run_on_startup: false
+fallback:
+  github_actions: .github/workflows/tools-fallback.yml
+  cron: "0 */6 * * *"
+env: {}
+flags: ["--quiet"]
+notes: |
+  Fetches the latest public-apis and n0shake/Public-APIs lists,
+  diffs against the local tools.yaml, and writes the new entries.
+  Runs from local tarball (air-gapped) when no internet, or
+  from public source when on the public network.
