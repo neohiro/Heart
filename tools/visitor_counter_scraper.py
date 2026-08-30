@@ -72,33 +72,41 @@ def _build_session() -> requests.Session:
 def load_registry() -> list[dict[str, Any]]:
     """Read the scrape registry from /links-secret/visitor-counters.yaml.
 
-    The YAML is intentionally not parsed here — the format is trivial and we
-    avoid pulling pyyaml as a hard dependency. Expected schema:
+    Parsed with yaml.safe_load when available; falls back to a minimal line-based
+    parser if yaml is not installed or parsing fails. Both paths return only
+    entries that have both auth_id and display_id.
 
+    Expected YAML schema:
         - id: neohiro.profile
           display_id: "1631162"
           auth_id: "8ce833a4b2722ea505cd7fff9a983daa572877b8"
           label: "neohiro/profile README"
-
-    Lines beginning with `#` and blank lines are ignored.
     """
     if not LINKS_SECRET.exists():
         LOG.error("%s missing — no scrape IDs available", LINKS_SECRET)
         return []
+
+    text = LINKS_SECRET.read_text(encoding="utf-8")
+
+    try:
+        import yaml  # type: ignore
+        data = yaml.safe_load(text)
+        if isinstance(data, list):
+            return [d for d in data if d.get("auth_id") and d.get("display_id")]
+    except Exception:  # noqa: BLE001 — fall through to line parser
+        pass
+
+    # Line-based fallback: handles registries without pyyaml or malformed YAML.
     out: list[dict[str, Any]] = []
     pending: dict[str, Any] = {}
-    with LINKS_SECRET.open("r", encoding="utf-8") as f:
-        text = f.read()
     for raw in text.splitlines():
         line = raw.strip()
         if not line or line.startswith("#"):
             continue
         if line.startswith("- id:") or line.startswith("id:"):
-            # Flush previous entry if it had the required fields
             if pending.get("auth_id") and pending.get("display_id"):
                 out.append(pending)
             elif pending.get("id"):
-                # Incomplete entry — log and skip rather than silently dropping.
                 LOG.warning("%s: dropping incomplete entry for id=%r (missing auth_id/display_id)", PHASE_SCRAPE, pending.get("id"))
             val = line.split(":", 1)[1].strip()
             pending = {"id": val.strip('"')}
@@ -113,14 +121,6 @@ def load_registry() -> list[dict[str, Any]]:
         out.append(pending)
     elif pending.get("id"):
         LOG.warning("%s: dropping incomplete entry for id=%r (missing auth_id/display_id)", PHASE_SCRAPE, pending.get("id"))
-    # Parse as proper YAML instead — fall back to yaml.safe_load for robustness.
-    try:
-        import yaml  # type: ignore
-        data = yaml.safe_load(text)
-        if isinstance(data, list):
-            return [d for d in data if d.get("auth_id") and d.get("display_id")]
-    except Exception as exc:  # noqa: BLE001 — log and continue with the cheap parse
-        LOG.warning("%s: yaml fallback failed (%s); using line parse", PHASE_SCRAPE, exc)
     return [c for c in out if c.get("auth_id") and c.get("display_id")]
 
 
@@ -257,6 +257,7 @@ def append_feed(per_counter: list[dict[str, Any]]) -> None:
     """Append per-cycle totals to the NDJSON audit feed (rolled hourly)."""
     WORLDMAP_FEED.parent.mkdir(parents=True, exist_ok=True)
     ts = _now_iso()
+    written = 0
     with WORLDMAP_FEED.open("a", encoding="utf-8") as f:
         for c in per_counter:
             row = {
@@ -266,6 +267,8 @@ def append_feed(per_counter: list[dict[str, Any]]) -> None:
                 "unique_24h": c.get("unique_24h"),
             }
             f.write(json.dumps(row) + "\n")
+            written += 1
+    LOG.info("%s: appended %d rows to %s", PHASE_PUBLISH, written, WORLDMAP_FEED)
 
 
 def bump_fail_counter(delta: int) -> int:
@@ -314,12 +317,18 @@ def read_fail_window(window_s: int = FAIL_WINDOW_SECONDS) -> list[dict[str, Any]
 
     Returns a list of {ts, ok, fails} dicts in chronological order.
     Drops malformed lines silently — they're audit data, not user input.
+    Returns an empty list if the log file does not yet exist.
     """
     if not FAIL_EVENTS.exists():
         return []
+    try:
+        text = FAIL_EVENTS.read_text(encoding="utf-8")
+    except OSError as exc:
+        LOG.warning("%s: cannot read event log: %s", PHASE_SCRAPE, exc)
+        return []
     cutoff = datetime.now(timezone.utc).timestamp() - window_s
     out: list[dict[str, Any]] = []
-    for raw in FAIL_EVENTS.read_text(encoding="utf-8").splitlines():
+    for raw in text.splitlines():
         raw = raw.strip()
         if not raw:
             continue

@@ -90,6 +90,24 @@ class TestRegistry:
         mod = __import__("visitor_counter_scraper")
         assert mod.load_registry() == []
 
+    def test_yaml_parse_failure_falls_back_to_line_parser(self, tmp_path, monkeypatch):
+        """Malformed YAML should fall through to the line-based parser."""
+        bad_path = tmp_path / "malformed.yaml"
+        bad_path.write_text(
+            "- id: line-parsed-entry\n  display_id: \"9999\"\n  auth_id: \"abc123\"\n  label: \"test\"\n- id: bad_yaml\n  display_id: \"XXXX\n  invalid yaml here: [\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("NEOHIRO_LINKS_SECRET", str(bad_path))
+        monkeypatch.setenv("NEOHIRO_SHARED_ROOT", str(tmp_path / "shared"))
+        for k in list(sys.modules.keys()):
+            if "visitor_counter_scraper" in k:
+                del sys.modules[k]
+        mod = __import__("visitor_counter_scraper")
+        registry = mod.load_registry()
+        assert len(registry) == 1
+        assert registry[0]["id"] == "line-parsed-entry"
+        assert registry[0]["auth_id"] == "abc123"
+
 
 # ── Fetch behavior ───────────────────────────────────────────────────────
 class TestFetch:
