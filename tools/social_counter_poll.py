@@ -52,7 +52,7 @@ def _load_keys() -> dict[str, dict[str, str]]:
         data = yaml.safe_load(LINKS_SECRET.read_text(encoding="utf-8"))
         return data or {}
     except Exception as exc:  # noqa: BLE001
-        logging.error("%s: failed to parse social-counters.yaml: %s", PHASE_SOCIAL, exc)
+        logging.warning("%s: failed to parse social-counters.yaml: %s", PHASE_SOCIAL, exc)
         return {}
 
 
