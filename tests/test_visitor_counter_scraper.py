@@ -3,11 +3,16 @@ test_visitor_counter_scraper.py — Heart/tools/visitor_counter_scraper.py tests
 
 Covers:
   - Registry parsing: load valid YAML; handle missing file; reject malformed entries
-  - Network: success path; transient failure → retry; permanent failure → None
-  - Output writers: worldmap datalayer; dashboard counters; NDJSON append feed
-  - Failure tracking: fail counter increments; resets on success
-  - Privacy: only country-level ISO codes make it into visitors.json
-  - Phase: every log line + emitted error includes a phase string (AGENTS.md Rule 5)
+  - Fetch: retry, deadline, JSON validation, auth_id normalization
+  - Writers: atomic writes (worldmap datalayer, dashboard counters, audit feed)
+  - Fail counter: bump/reset/guard
+  - Health-check: --health-check CLI flag (deploy smoke test)
+  - Event log: rolling cycle log with window filter
+
+Contract tests (marked @pytest.mark.contract):
+  - TestRunOnce: full cycle — RC 0 on success, RC 2 on empty registry, RC 3 on all-fail
+  - TestHealthCheck: --health-check — RC 0 on HTTP 200, RC 2 on empty registry, RC 3 on network error
+  - TestFailureTracking: fail counter + event log write/read round-trip
 """
 
 from __future__ import annotations
@@ -324,6 +329,7 @@ class TestAggregateCountries:
 
 
 # ── Failure tracking ─────────────────────────────────────────────────────
+@pytest.mark.contract
 class TestFailureTracking:
     def test_fail_counter_increments(self, scraper_mod):
         before = scraper_mod.bump_fail_counter(1)  # → 1
@@ -370,6 +376,7 @@ class TestPhaseLogging:
 
 
 # ── run_once integration ────────────────────────────────────────────────
+@pytest.mark.contract
 class TestRunOnce:
     def test_all_counters_succeed(self, scraper_mod, tmp_path):
         session = MagicMock()
@@ -412,6 +419,7 @@ class TestRunOnce:
 
 
 # ── Health check (live smoke test) ──────────────────────────────────────────
+@pytest.mark.contract
 class TestHealthCheck:
     def test_health_check_success(self, scraper_mod):
         session = MagicMock()

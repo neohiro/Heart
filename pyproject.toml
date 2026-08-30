@@ -1,0 +1,6 @@
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+strict_markers = true
+markers = [
+    "contract: tests that verify cross-component contracts (rate caps, partial-failure, secret-loading). Run with: pytest -m contract",
+]

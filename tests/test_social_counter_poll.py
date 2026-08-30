@@ -2,17 +2,19 @@
 test_social_counter_poll.py — Heart/tools/social_counter_poll.py tests
 
 Covers:
-  - Key loading: loads valid YAML; handles missing file
-  - YouTube: success; missing key → noop; HTTP error → retry
-  - X (Twitter): success; missing key → noop
-  - Instagram: success; missing key → noop
-  - Twitch: token acquisition failure → noop; follower count parsed
-  - Output: each platform writes its own JSON with updated_at timestamp
-  - Phase: every log line includes a phase string (AGENTS.md Rule 5)
-  - Privacy: no raw tokens written to output files
+  - Key loading: loads valid YAML; handles missing file; type guard for non-dict YAML
+  - YouTube/X/Instagram/Twitch polling: auth, retries, null-safety, atomic writes
+  - Health-check: --health-check CLI flag (deploy smoke test)
+  - Phase logging: structlog events include phase field
+
+Contract tests (marked @pytest.mark.contract):
+  - TestRunOnce: full cycle — RC 0 on any success, RC 3 on all-fail
+  - TestHealthCheck: --health-check — RC 0 on HTTP 200, RC 2 on empty config
 """
 
 from __future__ import annotations
+
+import pytest
 
 import json
 import logging
@@ -274,6 +276,7 @@ class TestPhaseLogging:
 
 
 # ── run_once ────────────────────────────────────────────────────────────
+@pytest.mark.contract
 class TestRunOnce:
     def test_all_platforms_succeed(self, poll_mod):
         session = MagicMock()
@@ -335,6 +338,7 @@ class TestRunOnce:
 
 
 # ── Health check (live smoke test) ──────────────────────────────────────────
+@pytest.mark.contract
 class TestHealthCheck:
     def test_health_check_first_platform_returns_data(self, poll_mod):
         """YouTube has keys in the fixture; health_check probes it first."""
