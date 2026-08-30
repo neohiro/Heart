@@ -91,6 +91,28 @@ class TestYouTube:
         assert result["views"] == 9876543
         assert result["videos"] == 42
 
+    def test_null_counts_become_zero(self, poll_mod):
+        """YouTube sometimes returns null for unindexed channels — must not TypeError."""
+        session = MagicMock()
+        resp = MagicMock()
+        resp.ok = True
+        resp.raise_for_status = MagicMock()
+        resp.json.return_value = {
+            "items": [{
+                "statistics": {
+                    "subscriberCount": None,
+                    "viewCount": None,
+                    "videoCount": None,
+                }
+            }]
+        }
+        session.get.return_value = resp
+        keys = {"youtube_api_key": "k", "youtube_channel_id": "c"}
+        result = poll_mod.poll_youtube(session, keys)
+        assert result["subscribers"] == 0
+        assert result["views"] == 0
+        assert result["videos"] == 0
+
     def test_missing_key_skips(self, poll_mod):
         result = poll_mod.poll_youtube(MagicMock(), {"youtube_api_key": ""})
         assert result == {}
@@ -107,6 +129,24 @@ class TestYouTube:
         result = poll_mod.poll_youtube(session, keys)
         assert result["subscribers"] == 1
         assert session.get.call_count == 2
+
+
+# ── _to_int helper (defensive int coercion) ─────────────────────────────
+class TestToInt:
+    def test_int_passthrough(self, poll_mod):
+        assert poll_mod._to_int(42) == 42
+
+    def test_string_numeric(self, poll_mod):
+        assert poll_mod._to_int("123") == 123
+
+    def test_none_returns_zero(self, poll_mod):
+        assert poll_mod._to_int(None) == 0
+
+    def test_unparseable_string_returns_zero(self, poll_mod):
+        assert poll_mod._to_int("n/a") == 0
+
+    def test_unparseable_type_returns_zero(self, poll_mod):
+        assert poll_mod._to_int({}) == 0
 
 
 # ── X (Twitter) ───────────────────────────────────────────────────────────

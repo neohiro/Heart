@@ -32,7 +32,6 @@ jobs:
         env:
           NEOHIRO_LINKS_SECRET: ${{ secrets.NEOHIRO_LINKS_SECRET }}
           NEOHIRO_SHARED_ROOT: /tmp/shared
-          RUN_ONCE: '1'
         run: |
           python Heart/tools/visitor_counter_scraper.py --quiet --once
 

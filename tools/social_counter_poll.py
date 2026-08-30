@@ -69,6 +69,20 @@ def _fetch_json(session: requests.Session, url: str, headers: dict, params: dict
     return None
 
 
+def _to_int(value: Any) -> int:
+    """Coerce a count to int, returning 0 on None or unparseable input.
+
+    API responses occasionally return None for unindexed channels; we treat
+    that as 0 rather than letting int(None) raise into the retry loop.
+    """
+    if value is None:
+        return 0
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
 def poll_youtube(session: requests.Session, keys: dict) -> dict[str, Any]:
     api_key = keys.get("youtube_api_key") or keys.get("NEOHIRO_YOUTUBE_API_KEY", "")
     channel_id = keys.get("youtube_channel_id", "")
@@ -83,9 +97,9 @@ def poll_youtube(session: requests.Session, keys: dict) -> dict[str, Any]:
         return {}
     stats = data.get("items", [{}])[0].get("statistics", {})
     return {
-        "subscribers": int(stats.get("subscriberCount", 0)),
-        "views": int(stats.get("viewCount", 0)),
-        "videos": int(stats.get("videoCount", 0)),
+        "subscribers": _to_int(stats.get("subscriberCount")),
+        "views": _to_int(stats.get("viewCount")),
+        "videos": _to_int(stats.get("videoCount")),
         "channel_id": channel_id,
     }
 

@@ -4,12 +4,12 @@
 # The Heart process reads this on every cycle and dispatches scripts
 # per the cadence keyword.
 #
-# STATUS: schema + scope registration. The referenced script files
-# (Heart/scripts/{news,osint,links-validate,tools}-populate/run.py)
-# are placeholders — to be implemented by a credentialed agent. Until
-# then, the `fallback_github_actions` cron is the effective cadence
-# (the live Heart at wingman-hub/.github/workflows/ runs the same
-# logical schedule).
+# STATUS: schema + scope registration. All four populate scripts are
+# implemented (Heart/scripts/{news,osint,links-validate,tools}-populate/run.py)
+# and unit-tested (Heart/scripts/tests/test_dispatchers.py — 23 tests pass).
+# The scripts read this REGISTRY.yaml, fetch the configured feeds, and
+# write to /shared/{news,osint,links,tools}/* with atomic writes + last-good
+# fallback. Run `python -m pytest Heart/scripts/tests/` to verify.
 schema_version: 2
 last_updated: 2026-08-30
 
@@ -26,6 +26,7 @@ scopes:
     fallback_github_actions: .github/workflows/news-fallback.yml
     env: {}
     flags: ["--quiet"]
+    status: implemented   # 2026-08-30
 
   - id: osint-populate
     description: "Refresh OSINT cache (crt.sh, RDAP, BGP, threat intel)."
@@ -37,6 +38,7 @@ scopes:
     fallback_github_actions: .github/workflows/osint-fallback.yml
     env: {}
     flags: ["--quiet"]
+    status: implemented   # 2026-08-30
 
   - id: links-validate
     description: "Validate all public + private links; mark broken; resolve pending."
@@ -48,6 +50,7 @@ scopes:
     fallback_github_actions: .github/workflows/links-fallback.yml
     env: {}
     flags: ["--quiet"]
+    status: implemented   # 2026-08-30
 
   - id: tools-populate
     description: "Refresh the PA tools catalog (re-emit tools.yaml from public-apis/n0shake diff)."
@@ -59,6 +62,7 @@ scopes:
     fallback_github_actions: .github/workflows/tools-fallback.yml
     env: {}
     flags: ["--quiet"]
+    status: implemented   # 2026-08-30
 
   - id: visitor-counter
     description: "Scrape freevisitorcounters.com auth endpoints; publish worldmap datalayer + dashboard counters."
@@ -71,7 +75,8 @@ scopes:
     env:
       NEOHIRO_SHARED_ROOT: "/shared"
       NEOHIRO_LINKS_SECRET: "/links-secret/visitor-counters.yaml"
-    flags: ["--quiet"]
+    flags: ["--quiet", "--once"]
+    status: implemented   # 2026-08-30
 
   - id: social-counter
     description: "Poll YouTube/X/IG/Twitch for the public-facing Social Media Counters section."
@@ -84,6 +89,21 @@ scopes:
     env:
       NEOHIRO_SHARED_ROOT: "/shared"
       NEOHIRO_LINKS_SECRET: "/links-secret/social-counters.yaml"
+    flags: ["--quiet", "--once"]
+    status: implemented   # 2026-08-30
+
+  - id: dependabot-aggregator
+    description: "Aggregate Dependabot open PRs + security advisories across all tracked repos. Writes /shared/net/public/dependabot.json."
+    path: network/scripts/heart_dependabot_scope.py
+    schedule: every_6_hours
+    timeout_seconds: 300
+    retry_on_failure: true
+    max_retries: 2
+    fallback_github_actions: .github/workflows/dependabot-aggregator.yml
+    env:
+      NEOHIRO_REGISTRY: "/heart/schedules/REGISTRY.yaml"
+      NEOHIRO_DEPENDABOT_OUT: "/shared/net/public"
+      NEOHIRO_GITHUB_TOKEN: "${NEOHIRO_GITHUB_TOKEN}"
     flags: ["--quiet"]
 
 # Per-scope failure demotion
