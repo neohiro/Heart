@@ -158,6 +158,21 @@ class TestWriters:
         # Sorted descending.
         assert out["countries"][0]["iso"] == "US"
 
+    def test_write_datalayer_handles_null_hits(self, scraper_mod):
+        """Vendor may return null for unknown countries — must not TypeError."""
+        per_counter = [
+            {"_id": "a", "countries": [
+                {"iso": "US", "hits": 10},
+                {"iso": "XX", "hits": None},       # explicit null
+                {"iso": "ZZ"},                    # missing key
+            ]},
+        ]
+        scraper_mod.write_datalayer(per_counter)
+        out = json.loads(scraper_mod.WORLDMAP_DATALAYER.read_text(encoding="utf-8"))
+        countries = {c["iso"]: c["hits_24h"] for c in out["countries"]}
+        # Null and missing should be treated as 0, not crash.
+        assert countries == {"US": 10, "XX": 0, "ZZ": 0}
+
     def test_write_counters_emits_summary(self, scraper_mod):
         per_counter = [
             {"_id": "a", "_label": "A", "hits": 100, "unique_24h": 50, "online": 3},

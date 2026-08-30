@@ -37,7 +37,6 @@ PHASE_PUBLISH = "scrape.publish"
 PHASE_DEGRADED = "scrape.degraded"
 
 DEFAULT_VENDOR_AUTH = "https://www.freevisitorcounters.com/auth.php"
-DEFAULT_STATS_BASE = "https://www.freevisitorcounters.com/en/home/counter"
 
 SHARED_ROOT = Path(os.environ.get("NEOHIRO_SHARED_ROOT", "/shared"))
 WORLDMAP_DATALAYER = SHARED_ROOT / "worldmap" / "datalayers" / "visitors.json"
@@ -164,7 +163,7 @@ def write_datalayer(per_counter: list[dict[str, Any]]) -> None:
             iso = country.get("iso")
             if not iso:
                 continue
-            country_totals[iso] = country_totals.get(iso, 0) + int(country.get("hits", 0))
+            country_totals[iso] = country_totals.get(iso, 0) + int(country.get("hits") or 0)
             last_seen[iso] = now
 
     payload = {
