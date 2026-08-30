@@ -305,7 +305,8 @@ class TestPhaseLogging:
         counter = {"id": "test", "auth_id": "abc", "display_id": "1234", "label": "t"}
         with caplog.at_level(logging.WARNING, logger="heart.visitor_counter_scraper"):
             scraper_mod.fetch_one(counter, session)
-        assert any(scraper_mod.PHASE_SCRAPE in r.message for r in caplog.records)
+        # structlog renders kwargs after the event name; getMessage() concatenates.
+        assert any(scraper_mod.PHASE_SCRAPE in r.getMessage() for r in caplog.records)
 
     def test_missing_registry_logs_phase(self, scraper_mod, caplog, tmp_path, monkeypatch):
         monkeypatch.setenv("NEOHIRO_LINKS_SECRET", str(tmp_path / "missing.yaml"))
@@ -320,7 +321,7 @@ class TestPhaseLogging:
             args = MagicMock()
             args.loop_seconds = 0
             mod.run_once(args)
-        assert any(mod.PHASE_SCRAPE in r.message for r in caplog.records)
+        assert any(mod.PHASE_SCRAPE in r.getMessage() for r in caplog.records)
 
 
 # ── run_once integration ────────────────────────────────────────────────
@@ -363,6 +364,39 @@ class TestRunOnce:
             import json as _json
             last = _json.loads(lines[-1])
             assert last["ok"] is False
+
+
+# ── Health check (live smoke test) ──────────────────────────────────────────
+class TestHealthCheck:
+    def test_health_check_success(self, scraper_mod):
+        session = MagicMock()
+        ok = MagicMock()
+        ok.ok = True
+        ok.raise_for_status = MagicMock()
+        ok.json.return_value = {"hits": 10, "countries": [{"iso": "US", "hits": 5}]}
+        session.get.return_value = ok
+        with patch.object(scraper_mod, "_build_session", return_value=session):
+            rc = scraper_mod.health_check()
+        assert rc == 0
+        session.close.assert_called_once()
+
+    def test_health_check_registry_empty(self, scraper_mod, tmp_path, monkeypatch):
+        monkeypatch.setenv("NEOHIRO_LINKS_SECRET", str(tmp_path / "missing.yaml"))
+        for k in list(sys.modules.keys()):
+            if "visitor_counter_scraper" in k:
+                del sys.modules[k]
+        mod = __import__("visitor_counter_scraper")
+        rc = mod.health_check()
+        assert rc == 2
+
+    def test_health_check_fetch_fails(self, scraper_mod):
+        session = MagicMock()
+        import requests
+        session.get.side_effect = requests.RequestException("network down")
+        with patch.object(scraper_mod, "_build_session", return_value=session):
+            rc = scraper_mod.health_check()
+        assert rc == 3
+        session.close.assert_called_once()
 
 
 # ── Rolling event log ───────────────────────────────────────────────────

@@ -1,18 +1,18 @@
 # Heart/tools/visitor_counter_scraper.py
 #
-# Phase: scrape (per AGENTS.md Rule 5 â€” every error must include a phase).
+# Phase: scrape (per AGENTS.md Rule 5 — every error must include a phase).
 #
 # Polls freevisitorcounters.com's authenticated stats endpoint for every
 # counter registered in links-secret/visitor-counters.yaml, then writes:
-#   1. /shared/worldmap/datalayers/visitors.json    â€” country-level aggregates
-#   2. /shared/dashboard/counters/counters.json    â€” per-counter live totals
-#   3. /shared/worldmap/feeds/visitor-events.ndjson â€” append-only audit log
+#   1. /shared/worldmap/datalayers/visitors.json    — country-level aggregates
+#   2. /shared/dashboard/counters/counters.json    — per-counter live totals
+#   3. /shared/worldmap/feeds/visitor-events.ndjson — append-only audit log
 #
 # Schedule: every 5 minutes (see Heart/schedules/REGISTRY.yaml -> visitor-counter).
 # Failure handling: see failure_policy block in REGISTRY.yaml; demote after 5,
 # pause after 20 consecutive failures.
 #
-# Secrets: the scrape IDs live in /links-secret/visitor-counters.yaml â€” this
+# Secrets: the scrape IDs live in /links-secret/visitor-counters.yaml — this
 # script NEVER touches a public repo or committed YAML.
 
 from __future__ import annotations
@@ -28,10 +28,25 @@ from pathlib import Path
 from typing import Any
 
 import requests
+import structlog
 
-LOG = logging.getLogger("heart.visitor_counter_scraper")
+LOG = structlog.get_logger("heart.visitor_counter_scraper")
 
-# Phase names â€” every emitted log line + error must include one of these.
+# Configure structlog to route through stdlib logging so caplog + log aggregators
+# see the events. Idempotent: repeated imports are no-ops via already_configured.
+structlog.configure(
+    processors=[
+        structlog.stdlib.add_log_level,
+        structlog.stdlib.add_logger_name,
+        structlog.processors.KeyValueRenderer(
+            key_order=["event", "phase", "counter_id", "error"],
+        ),
+    ],
+    wrapper_class=structlog.stdlib.BoundLogger,
+    logger_factory=structlog.stdlib.LoggerFactory(),
+)
+
+# Phase names — every emitted log line + error must include one of these.
 PHASE_SCRAPE = "scrape"
 PHASE_PUBLISH = "scrape.publish"
 PHASE_DEGRADED = "scrape.degraded"
@@ -83,7 +98,7 @@ def load_registry() -> list[dict[str, Any]]:
           label: "neohiro/profile README"
     """
     if not LINKS_SECRET.exists():
-        LOG.error("%s missing â€” no scrape IDs available", LINKS_SECRET)
+        LOG.error("registry_missing", path=str(LINKS_SECRET))
         return []
 
     text = LINKS_SECRET.read_text(encoding="utf-8")
@@ -93,7 +108,7 @@ def load_registry() -> list[dict[str, Any]]:
         data = yaml.safe_load(text)
         if isinstance(data, list):
             return [d for d in data if d.get("auth_id") and d.get("display_id")]
-    except Exception:  # noqa: BLE001 â€” fall through to line parser
+    except Exception:  # noqa: BLE001 — fall through to line parser
         pass
 
     # Line-based fallback: handles registries without pyyaml or malformed YAML.
@@ -107,7 +122,7 @@ def load_registry() -> list[dict[str, Any]]:
             if pending.get("auth_id") and pending.get("display_id"):
                 out.append(pending)
             elif pending.get("id"):
-                LOG.warning("%s: dropping incomplete entry for id=%r (missing auth_id/display_id)", PHASE_SCRAPE, pending.get("id"))
+                LOG.warning("incomplete_entry_dropped", phase=PHASE_SCRAPE, counter_id=pending.get("id"))
             val = line.split(":", 1)[1].strip()
             pending = {"id": val.strip('"')}
             continue
@@ -120,7 +135,7 @@ def load_registry() -> list[dict[str, Any]]:
     if pending.get("auth_id") and pending.get("display_id"):
         out.append(pending)
     elif pending.get("id"):
-        LOG.warning("%s: dropping incomplete entry for id=%r (missing auth_id/display_id)", PHASE_SCRAPE, pending.get("id"))
+        LOG.warning("incomplete_entry_dropped", phase=PHASE_SCRAPE, counter_id=pending.get("id"))
     return [c for c in out if c.get("auth_id") and c.get("display_id")]
 
 
@@ -147,8 +162,9 @@ def fetch_one(
         remaining = deadline - _time.monotonic()
         if remaining <= 0:
             LOG.warning(
-                "%s: counter %s deadline %ss exhausted (last: %s)",
-                PHASE_SCRAPE, counter["id"], deadline_s, last_exc,
+                "counter_deadline_exhausted",
+                phase=PHASE_SCRAPE, counter_id=counter["id"],
+                deadline_s=deadline_s, last_error=last_exc,
             )
             return None
         try:
@@ -162,14 +178,16 @@ def fetch_one(
         except requests.RequestException as exc:
             last_exc = f"{type(exc).__name__}: {exc}"
             LOG.warning(
-                "%s: counter %s attempt %d/%d failed: %s",
-                PHASE_SCRAPE, counter["id"], attempt, MAX_RETRIES, exc,
+                "counter_attempt_failed",
+                phase=PHASE_SCRAPE, counter_id=counter["id"],
+                attempt=attempt, max_retries=MAX_RETRIES, error=str(exc),
             )
         except ValueError as exc:
             last_exc = f"{type(exc).__name__}: {exc}"
             LOG.warning(
-                "%s: counter %s returned non-JSON (attempt %d): %s",
-                PHASE_SCRAPE, counter["id"], attempt, exc,
+                "counter_non_json_response",
+                phase=PHASE_SCRAPE, counter_id=counter["id"],
+                attempt=attempt, error=str(exc),
             )
     return None
 
@@ -181,9 +199,9 @@ def aggregate_countries(
     """Pure aggregation: roll up per-counter country hits into totals.
 
     Returns (country_totals, last_seen, timestamp) where:
-      country_totals â€” {iso: total_hits}
-      last_seen    â€” {iso: last_seen_ts}  (all set to `now`)
-      timestamp    â€” the `now` value used (ISO or generated)
+      country_totals — {iso: total_hits}
+      last_seen    — {iso: last_seen_ts}  (all set to `now`)
+      timestamp    — the `now` value used (ISO or generated)
 
     No I/O, no filesystem access. Fully testable in isolation.
     """
@@ -225,11 +243,11 @@ def write_datalayer(per_counter: list[dict[str, Any]]) -> None:
     }
     WORLDMAP_DATALAYER.parent.mkdir(parents=True, exist_ok=True)
     # Atomic write: temp + rename. Survives partial writes if the process
-    # crashes mid-write â€” readers always see either the old or new file.
+    # crashes mid-write — readers always see either the old or new file.
     tmp = WORLDMAP_DATALAYER.with_suffix(WORLDMAP_DATALAYER.suffix + ".tmp")
     tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     tmp.replace(WORLDMAP_DATALAYER)
-    LOG.info("%s: wrote %d countries to %s", PHASE_PUBLISH, len(payload["countries"]), WORLDMAP_DATALAYER)
+    LOG.info("wrote_datalayer", phase=PHASE_PUBLISH, countries=len(payload["countries"]), path=str(WORLDMAP_DATALAYER))
 
 
 def write_counters(per_counter: list[dict[str, Any]]) -> None:
@@ -268,7 +286,7 @@ def append_feed(per_counter: list[dict[str, Any]]) -> None:
             }
             f.write(json.dumps(row) + "\n")
             written += 1
-    LOG.info("%s: appended %d rows to %s", PHASE_PUBLISH, written, WORLDMAP_FEED)
+    LOG.info("appended_feed_rows", phase=PHASE_PUBLISH, rows=written, path=str(WORLDMAP_FEED))
 
 
 def bump_fail_counter(delta: int) -> int:
@@ -322,7 +340,7 @@ def read_fail_window(window_s: int = FAIL_WINDOW_SECONDS) -> list[dict[str, Any]
     """Read cycle events from the last `window_s` seconds.
 
     Returns a list of {ts, ok, fails} dicts in chronological order.
-    Drops malformed lines silently â€” they're audit data, not user input.
+    Drops malformed lines silently — they're audit data, not user input.
     Returns an empty list if the log file does not yet exist.
     """
     if not FAIL_EVENTS.exists():
@@ -330,7 +348,7 @@ def read_fail_window(window_s: int = FAIL_WINDOW_SECONDS) -> list[dict[str, Any]
     try:
         text = FAIL_EVENTS.read_text(encoding="utf-8")
     except OSError as exc:
-        LOG.warning("%s: cannot read event log: %s", PHASE_SCRAPE, exc)
+        LOG.warning("event_log_read_failed", phase=PHASE_SCRAPE, error=str(exc))
         return []
     cutoff = datetime.now(timezone.utc).timestamp() - window_s
     out: list[dict[str, Any]] = []
@@ -358,7 +376,7 @@ def read_fail_window(window_s: int = FAIL_WINDOW_SECONDS) -> list[dict[str, Any]
 def run_once(args: argparse.Namespace) -> int:
     registry = load_registry()
     if not registry:
-        LOG.error("%s: registry empty or missing â€” aborting cycle", PHASE_SCRAPE)
+        LOG.error("registry_empty_abort", phase=PHASE_SCRAPE)
         bump_fail_counter(1)
         record_cycle_event(ok=False)
         return 2
@@ -377,7 +395,7 @@ def run_once(args: argparse.Namespace) -> int:
         session.close()
 
     if not results:
-        LOG.error("%s: every counter failed (failures=%d)", PHASE_DEGRADED, failures)
+        LOG.error("all_counters_failed", phase=PHASE_DEGRADED, failures=failures)
         bump_fail_counter(1)
         record_cycle_event(ok=False)
         return 3
@@ -387,17 +405,46 @@ def run_once(args: argparse.Namespace) -> int:
         write_counters(results)
         append_feed(results)
     except OSError as exc:
-        LOG.error("%s: publish failed: %s", PHASE_PUBLISH, exc)
+        LOG.error("publish_failed", phase=PHASE_PUBLISH, error=str(exc))
         bump_fail_counter(1)
         record_cycle_event(ok=False)
         return 4
 
-    # Successful cycle â€” reset fail counter.
+    # Successful cycle — reset fail counter.
     if failures:
-        LOG.warning("%s: %d/%d counters failed but at least one succeeded", PHASE_DEGRADED, failures, len(registry))
+        LOG.warning("partial_failure", phase=PHASE_DEGRADED, failures=failures, total=len(registry))
     bump_fail_counter(0)
     record_cycle_event(ok=True)
-    LOG.info("%s: cycle complete â€” %d/%d counters", PHASE_SCRAPE, len(results), len(registry))
+    LOG.info("cycle_complete", phase=PHASE_SCRAPE, succeeded=len(results), total=len(registry))
+    return 0
+
+
+def health_check() -> int:
+    """Live smoke test: hit the vendor auth endpoint and exit 0 on HTTP 200.
+
+    Use as a deploy verification step:
+        python visitor_counter_scraper.py --health-check
+
+    Returns 0 on success, 2 if the registry is empty, 3 on any network failure.
+    Does not write to /shared — read-only.
+    """
+    registry = load_registry()
+    if not registry:
+        LOG.error("health_check_no_registry", phase=PHASE_SCRAPE)
+        return 2
+    counter = registry[0]
+    session = _build_session()
+    try:
+        payload = fetch_one(counter, session, PER_COUNTER_DEADLINE)
+    finally:
+        session.close()
+    if payload is None:
+        LOG.error("health_check_fetch_failed", phase=PHASE_SCRAPE, counter_id=counter["id"])
+        return 3
+    if not isinstance(payload, dict) or not payload:
+        LOG.error("health_check_empty_payload", phase=PHASE_SCRAPE, counter_id=counter["id"])
+        return 3
+    LOG.info("health_check_ok", phase=PHASE_SCRAPE, counter_id=counter["id"], keys=len(payload))
     return 0
 
 
@@ -406,6 +453,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--once", action="store_true", help="Single cycle then exit (default)")
     parser.add_argument("--loop-seconds", type=int, default=0, help="If >0, loop with this delay")
     parser.add_argument("--quiet", action="store_true")
+    parser.add_argument(
+        "--health-check", action="store_true",
+        help="Live smoke test: hit vendor API for the first registry counter; exit 0 on HTTP 200",
+    )
     args = parser.parse_args(argv)
 
     logging.basicConfig(
@@ -413,6 +464,8 @@ def main(argv: list[str] | None = None) -> int:
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
 
+    if args.health_check:
+        return health_check()
     if args.loop_seconds > 0:
         while True:
             run_once(args)

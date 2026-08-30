@@ -270,7 +270,7 @@ class TestPhaseLogging:
     def test_warn_log_includes_phase(self, poll_mod, caplog):
         with caplog.at_level(logging.WARNING, logger="heart.social_counter_poll"):
             poll_mod.poll_youtube(MagicMock(), {"youtube_api_key": ""})
-        assert any(poll_mod.PHASE_SOCIAL in r.message for r in caplog.records)
+        assert any(poll_mod.PHASE_SOCIAL in r.getMessage() for r in caplog.records)
 
 
 # ── run_once ────────────────────────────────────────────────────────────
@@ -332,3 +332,33 @@ class TestRunOnce:
             rc = poll_mod.main(["--once", "--quiet"])
         assert rc == 0
         assert (poll_mod.SOCIAL_DIR / "youtube.json").exists()
+
+
+# ── Health check (live smoke test) ──────────────────────────────────────────
+class TestHealthCheck:
+    def test_health_check_first_platform_returns_data(self, poll_mod):
+        """YouTube has keys in the fixture; health_check probes it first."""
+        session = MagicMock()
+        resp = MagicMock()
+        resp.ok = True
+        resp.raise_for_status = MagicMock()
+        resp.json.return_value = {
+            "items": [{"statistics": {"subscriberCount": "1234"}}]
+        }
+        session.get.return_value = resp
+        with patch("requests.Session", return_value=session):
+            rc = poll_mod.health_check()
+        assert rc == 0
+
+    def test_health_check_no_platforms_configured(self, poll_mod, tmp_path, monkeypatch):
+        """No API keys at all: health_check should exit 2 (nothing to probe)."""
+        empty_path = tmp_path / "empty.yaml"
+        empty_path.write_text("# no keys\n", encoding="utf-8")
+        monkeypatch.setenv("NEOHIRO_LINKS_SECRET", str(empty_path))
+        for k in list(sys.modules.keys()):
+            if "social_counter_poll" in k:
+                del sys.modules[k]
+        mod = __import__("social_counter_poll")
+        monkeypatch.setenv("NEOHIRO_SHARED_ROOT", str(tmp_path / "shared"))
+        rc = mod.health_check()
+        assert rc == 2
