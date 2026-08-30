@@ -235,29 +235,31 @@ def run_once(args: argparse.Namespace) -> int:
     keys = _load_keys()
     session = requests.Session()
     session.headers["User-Agent"] = "neohiro-Heart/1.0 (+https://neohiro.github.io)"
+    try:
+        results: dict[str, dict] = {}
+        results["youtube"] = poll_youtube(session, keys)
+        results["x"] = poll_x(session, keys)
+        results["instagram"] = poll_instagram(session, keys)
+        results["twitch"] = poll_twitch(session, keys)
 
-    results: dict[str, dict] = {}
-    results["youtube"] = poll_youtube(session, keys)
-    results["x"] = poll_x(session, keys)
-    results["instagram"] = poll_instagram(session, keys)
-    results["twitch"] = poll_twitch(session, keys)
+        for name, payload in results.items():
+            if payload:
+                write_output(name, payload)
 
-    for name, payload in results.items():
-        if payload:
-            write_output(name, payload)
-
-    successes = sum(1 for v in results.values() if v)
-    failures = len(results) - successes
-    if successes == 0:
-        LOG.error("all_platforms_failed", phase=PHASE_SOCIAL)
-        return 3
-    if failures > 0:
-        # Partial failure: at least one platform is missing fresh data. Doctor's
-        # H-09 freshness check will surface this; we still exit 0 because the
-        # write side is non-critical and we don't want to over-pager.
-        LOG.warning("partial_failure", phase=PHASE_SOCIAL, successes=successes, total=len(results))
-    LOG.info("poll_complete", phase=PHASE_SOCIAL, successes=successes, total=len(results))
-    return 0
+        successes = sum(1 for v in results.values() if v)
+        failures = len(results) - successes
+        if successes == 0:
+            LOG.error("all_platforms_failed", phase=PHASE_SOCIAL)
+            return 3
+        if failures > 0:
+            # Partial failure: at least one platform is missing fresh data. Doctor's
+            # H-09 freshness check will surface this; we still exit 0 because the
+            # write side is non-critical and we don't want to over-pager.
+            LOG.warning("partial_failure", phase=PHASE_SOCIAL, successes=successes, total=len(results))
+        LOG.info("poll_complete", phase=PHASE_SOCIAL, successes=successes, total=len(results))
+        return 0
+    finally:
+        session.close()
 
 
 def health_check() -> int:

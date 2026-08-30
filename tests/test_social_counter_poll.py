@@ -307,6 +307,7 @@ class TestRunOnce:
         # At least one output file should exist.
         assert any((poll_mod.SOCIAL_DIR / f"{p}.json").exists()
                    for p in ["youtube", "x", "instagram", "twitch"])
+        session.close.assert_called_once()
 
     def test_all_fail_returns_error(self, poll_mod):
         session = MagicMock()
@@ -315,6 +316,7 @@ class TestRunOnce:
         with patch("requests.Session", return_value=session):
             rc = poll_mod.main(["--once", "--quiet"])
         assert rc == 3
+        session.close.assert_called_once()
 
     def test_partial_failure_writes_what_succeeds(self, poll_mod):
         """Some platforms up, some down: writes the ones that worked, rc=0."""
