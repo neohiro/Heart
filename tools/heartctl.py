@@ -208,6 +208,9 @@ def cmd_phase(args: argparse.Namespace) -> int:
 
 def cmd_trigger(args: argparse.Namespace) -> int:
     script = Path(__file__).parent / "heart.py"
+    if not script.is_file():
+        print(f"heartctl: error: {script} not found", file=sys.stderr)
+        return 127
     cmd = [sys.executable, str(script), "--once"]
     if args.brain_path:
         cmd.extend(["--brain-path", args.brain_path])
