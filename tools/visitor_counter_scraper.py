@@ -127,7 +127,7 @@ def load_registry() -> list[dict[str, Any]]:
                 "id": pending["id"],
                 "auth_id": auth.strip(),
                 "display_id": disp.strip(),
-                **({"label": pending["label"]} if isinstance(pending.get("label"), str) else {}),
+                **({"label": pending["label"].strip()} if isinstance(pending.get("label"), str) else {}),
             })
         elif pending.get("id"):
             LOG.warning("incomplete_entry_dropped", phase=PHASE_SCRAPE, counter_id=pending.get("id"))
@@ -138,7 +138,7 @@ def load_registry() -> list[dict[str, Any]]:
         if line.startswith("- id:") or line.startswith("id:"):
             _flush()
             val = line.split(":", 1)[1].strip()
-            pending = {"id": val.strip('"')}
+            pending = {"id": val.strip('"').strip()}
             continue
         if line.startswith("display_id:"):
             pending["display_id"] = line.split(":", 1)[1].strip().strip('"')
@@ -181,6 +181,8 @@ def fetch_one(
             r = session.get(url, timeout=(min(remaining, REQUEST_TIMEOUT), REQUEST_TIMEOUT))
             r.raise_for_status()
             payload = r.json()
+            if not isinstance(payload, dict):
+                raise ValueError(f"unexpected JSON type {type(payload).__name__}: expected dict")
             payload["_id"] = counter["id"]
             payload["_label"] = counter.get("label", counter["id"])
             payload["_fetched_at"] = _now_iso()
@@ -449,18 +451,22 @@ def health_check() -> int:
     if not isinstance(auth_id, str) or not auth_id.strip():
         LOG.error("health_check_invalid_auth_id", phase=PHASE_SCRAPE, counter_id=counter.get("id"))
         return 3
+    counter_id = counter.get("id")
+    if not isinstance(counter_id, str) or not counter_id.strip():
+        LOG.error("health_check_invalid_counter_id", phase=PHASE_SCRAPE)
+        return 3
     session = _build_session()
     try:
         payload = fetch_one(counter, session, PER_COUNTER_DEADLINE)
     finally:
         session.close()
     if payload is None:
-        LOG.error("health_check_fetch_failed", phase=PHASE_SCRAPE, counter_id=counter["id"])
+        LOG.error("health_check_fetch_failed", phase=PHASE_SCRAPE, counter_id=counter_id)
         return 3
     if not isinstance(payload, dict) or not payload:
-        LOG.error("health_check_empty_payload", phase=PHASE_SCRAPE, counter_id=counter["id"])
+        LOG.error("health_check_empty_payload", phase=PHASE_SCRAPE, counter_id=counter_id)
         return 3
-    LOG.info("health_check_ok", phase=PHASE_SCRAPE, counter_id=counter["id"], keys=len(payload))
+    LOG.info("health_check_ok", phase=PHASE_SCRAPE, counter_id=counter_id, keys=len(payload))
     return 0
 
 

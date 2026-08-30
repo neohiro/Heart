@@ -108,6 +108,27 @@ class TestRegistry:
         assert registry[0]["id"] == "line-parsed-entry"
         assert registry[0]["auth_id"] == "abc123"
 
+    def test_line_fallback_strips_quotes_and_whitespace_from_all_fields(self, tmp_path, monkeypatch):
+        """Line-based parser should strip surrounding quotes and whitespace from id, label."""
+        path = tmp_path / "nopyaml.yaml"
+        # Use invalid YAML so the line-fallback path is forced.
+        path.write_text(
+            '- id: "  spaced-id  "\n  display_id: "  9999  "\n  auth_id: "  abc123  "\n  label: "  spaced label  "\n- id: bad\n  display_id: "XXXX\n  [invalid\n',
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("NEOHIRO_LINKS_SECRET", str(path))
+        monkeypatch.setenv("NEOHIRO_SHARED_ROOT", str(tmp_path / "shared"))
+        for k in list(sys.modules.keys()):
+            if "visitor_counter_scraper" in k:
+                del sys.modules[k]
+        mod = __import__("visitor_counter_scraper")
+        registry = mod.load_registry()
+        assert len(registry) == 1
+        assert registry[0]["id"] == "spaced-id"
+        assert registry[0]["auth_id"] == "abc123"
+        assert registry[0]["display_id"] == "9999"
+        assert registry[0]["label"] == "spaced label"
+
 
 # ── Fetch behavior ───────────────────────────────────────────────────────
 class TestFetch:
@@ -124,6 +145,30 @@ class TestFetch:
         assert result["hits"] == 123
         assert result["_id"] == "test"
         assert "_fetched_at" in result
+
+    def test_non_dict_json_response_returns_none(self, scraper_mod):
+        """Server returns [] (empty list) — must not raise TypeError on item assignment."""
+        session = MagicMock()
+        response = MagicMock()
+        response.ok = True
+        response.json.return_value = []  # not a dict
+        response.raise_for_status = MagicMock()
+        session.get.return_value = response
+        counter = {"id": "test", "auth_id": "abc", "display_id": "1234"}
+        result = scraper_mod.fetch_one(counter, session)
+        assert result is None  # falls through to None
+
+    def test_null_json_response_returns_none(self, scraper_mod):
+        """Server returns null (empty body) — must not raise TypeError."""
+        session = MagicMock()
+        response = MagicMock()
+        response.ok = True
+        response.json.return_value = None
+        response.raise_for_status = MagicMock()
+        session.get.return_value = response
+        counter = {"id": "test", "auth_id": "abc", "display_id": "1234"}
+        result = scraper_mod.fetch_one(counter, session)
+        assert result is None
 
     def test_transient_failure_retries(self, scraper_mod):
         session = MagicMock()
@@ -401,6 +446,15 @@ class TestHealthCheck:
     def test_health_check_invalid_auth_id_skips_session(self, scraper_mod):
         """If registry[0] has whitespace-only auth_id, exit 3 without making a request."""
         bad_counter = {"id": "bad", "auth_id": "   ", "display_id": "1"}
+        with patch.object(scraper_mod, "load_registry", return_value=[bad_counter]):
+            with patch.object(scraper_mod, "_build_session") as build_session:
+                rc = scraper_mod.health_check()
+        assert rc == 3
+        build_session.assert_not_called()
+
+    def test_health_check_invalid_counter_id_skips_session(self, scraper_mod):
+        """If registry[0] has whitespace-only id, exit 3 without making a request."""
+        bad_counter = {"id": "  ", "auth_id": "abc", "display_id": "1"}
         with patch.object(scraper_mod, "load_registry", return_value=[bad_counter]):
             with patch.object(scraper_mod, "_build_session") as build_session:
                 rc = scraper_mod.health_check()
