@@ -28,14 +28,18 @@ import structlog
 PHASE_SOCIAL = "social"
 PHASE_PUBLISH = "social.publish"
 
+def _drop_none(logger, method, event_dict):
+    """Filter None values from structlog events to reduce log noise."""
+    return {k: v for k, v in event_dict.items() if v is not None}
+
+
 LOG = structlog.get_logger("heart.social_counter_poll")
 
 # Configure structlog to route through stdlib logging so caplog + log aggregators
 # see the events. Idempotent: repeated imports are no-ops via already_configured.
 structlog.configure(
     processors=[
-        structlog.stdlib.add_log_level,
-        structlog.stdlib.add_logger_name,
+        _drop_none,
         structlog.processors.KeyValueRenderer(
             key_order=["event", "phase", "platform", "counter_id", "error"],
         ),
