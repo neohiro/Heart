@@ -362,3 +362,34 @@ class TestHealthCheck:
         monkeypatch.setenv("NEOHIRO_SHARED_ROOT", str(tmp_path / "shared"))
         rc = mod.health_check()
         assert rc == 2
+
+
+# ── Key-loading robustness ──────────────────────────────────────────────────
+class TestLoadKeysRobustness:
+    def test_load_keys_returns_empty_on_list_yaml(self, poll_mod, tmp_path, monkeypatch):
+        """Valid YAML that is not a dict: must not crash callers with AttributeError."""
+        bad_yaml = tmp_path / "bad.yaml"
+        bad_yaml.write_text("- a\n- b\n", encoding="utf-8")
+        monkeypatch.setenv("NEOHIRO_LINKS_SECRET", str(bad_yaml))
+        for k in list(sys.modules.keys()):
+            if "social_counter_poll" in k:
+                del sys.modules[k]
+        mod = __import__("social_counter_poll")
+        monkeypatch.setenv("NEOHIRO_SHARED_ROOT", str(tmp_path / "shared"))
+        keys = mod._load_keys()
+        assert keys == {}
+        assert isinstance(keys, dict)
+
+    def test_load_keys_returns_empty_on_string_yaml(self, poll_mod, tmp_path, monkeypatch):
+        """Top-level scalar YAML (not a dict or list): must not crash callers."""
+        bad_yaml = tmp_path / "scalar.yaml"
+        bad_yaml.write_text("just a string\n", encoding="utf-8")
+        monkeypatch.setenv("NEOHIRO_LINKS_SECRET", str(bad_yaml))
+        for k in list(sys.modules.keys()):
+            if "social_counter_poll" in k:
+                del sys.modules[k]
+        mod = __import__("social_counter_poll")
+        monkeypatch.setenv("NEOHIRO_SHARED_ROOT", str(tmp_path / "shared"))
+        keys = mod._load_keys()
+        assert keys == {}
+        assert isinstance(keys, dict)

@@ -398,6 +398,39 @@ class TestHealthCheck:
         assert rc == 3
         session.close.assert_called_once()
 
+    def test_health_check_invalid_auth_id_skips_session(self, scraper_mod):
+        """If registry[0] has whitespace-only auth_id, exit 3 without making a request."""
+        bad_counter = {"id": "bad", "auth_id": "   ", "display_id": "1"}
+        with patch.object(scraper_mod, "load_registry", return_value=[bad_counter]):
+            with patch.object(scraper_mod, "_build_session") as build_session:
+                rc = scraper_mod.health_check()
+        assert rc == 3
+        build_session.assert_not_called()
+
+
+# ── Registry auth_id normalization ────────────────────────────────────────
+class TestLoadRegistryValidation:
+    def test_load_registry_strips_whitespace(self, scraper_mod, tmp_path):
+        registry_yaml = tmp_path / "visitor-counters.yaml"
+        registry_yaml.write_text(
+            '- id: a\n  display_id: "  123  "\n  auth_id: "  abc  "\n',
+            encoding="utf-8",
+        )
+        with patch.object(scraper_mod, "LINKS_SECRET", registry_yaml):
+            result = scraper_mod.load_registry()
+        assert result[0]["auth_id"] == "abc"
+        assert result[0]["display_id"] == "123"
+
+    def test_load_registry_drops_whitespace_only_auth(self, scraper_mod, tmp_path):
+        registry_yaml = tmp_path / "visitor-counters.yaml"
+        registry_yaml.write_text(
+            '- id: bad\n  display_id: "1"\n  auth_id: "   "\n',
+            encoding="utf-8",
+        )
+        with patch.object(scraper_mod, "LINKS_SECRET", registry_yaml):
+            result = scraper_mod.load_registry()
+        assert result == []
+
 
 # ── Rolling event log ───────────────────────────────────────────────────
 class TestRollingEventLog:

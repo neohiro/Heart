@@ -107,22 +107,36 @@ def load_registry() -> list[dict[str, Any]]:
         import yaml  # type: ignore
         data = yaml.safe_load(text)
         if isinstance(data, list):
-            return [d for d in data if d.get("auth_id") and d.get("display_id")]
+            return [
+                {**d, "auth_id": d["auth_id"].strip(), "display_id": d["display_id"].strip()}
+                for d in data
+                if isinstance(d.get("auth_id"), str) and d["auth_id"].strip()
+                and isinstance(d.get("display_id"), str) and d["display_id"].strip()
+            ]
     except Exception:  # noqa: BLE001 — fall through to line parser
         pass
 
     # Line-based fallback: handles registries without pyyaml or malformed YAML.
     out: list[dict[str, Any]] = []
     pending: dict[str, Any] = {}
+    def _flush():
+        auth = pending.get("auth_id")
+        disp = pending.get("display_id")
+        if isinstance(auth, str) and auth.strip() and isinstance(disp, str) and disp.strip():
+            out.append({
+                "id": pending["id"],
+                "auth_id": auth.strip(),
+                "display_id": disp.strip(),
+                **({"label": pending["label"]} if isinstance(pending.get("label"), str) else {}),
+            })
+        elif pending.get("id"):
+            LOG.warning("incomplete_entry_dropped", phase=PHASE_SCRAPE, counter_id=pending.get("id"))
     for raw in text.splitlines():
         line = raw.strip()
         if not line or line.startswith("#"):
             continue
         if line.startswith("- id:") or line.startswith("id:"):
-            if pending.get("auth_id") and pending.get("display_id"):
-                out.append(pending)
-            elif pending.get("id"):
-                LOG.warning("incomplete_entry_dropped", phase=PHASE_SCRAPE, counter_id=pending.get("id"))
+            _flush()
             val = line.split(":", 1)[1].strip()
             pending = {"id": val.strip('"')}
             continue
@@ -132,11 +146,8 @@ def load_registry() -> list[dict[str, Any]]:
             pending["auth_id"] = line.split(":", 1)[1].strip().strip('"')
         elif line.startswith("label:"):
             pending["label"] = line.split(":", 1)[1].strip().strip('"')
-    if pending.get("auth_id") and pending.get("display_id"):
-        out.append(pending)
-    elif pending.get("id"):
-        LOG.warning("incomplete_entry_dropped", phase=PHASE_SCRAPE, counter_id=pending.get("id"))
-    return [c for c in out if c.get("auth_id") and c.get("display_id")]
+    _flush()
+    return out
 
 
 def fetch_one(
@@ -153,13 +164,12 @@ def fetch_one(
     can never consume more wall-clock than that, regardless of how many
     individual timeouts occur.
     """
-    import time as _time
+    deadline = time.monotonic() + deadline_s
     auth_id = counter["auth_id"]
     url = f"{DEFAULT_VENDOR_AUTH}?id={auth_id}"
-    deadline = _time.monotonic() + deadline_s
     last_exc: str = ""
     for attempt in range(1, MAX_RETRIES + 1):
-        remaining = deadline - _time.monotonic()
+        remaining = deadline - time.monotonic()
         if remaining <= 0:
             LOG.warning(
                 "counter_deadline_exhausted",
@@ -433,6 +443,12 @@ def health_check() -> int:
         LOG.error("health_check_no_registry", phase=PHASE_SCRAPE)
         return 2
     counter = registry[0]
+    # Validate auth_id is a non-empty string (registry filter checks truthiness,
+    # but "  " is truthy in Python and would cause a malformed URL).
+    auth_id = counter.get("auth_id")
+    if not isinstance(auth_id, str) or not auth_id.strip():
+        LOG.error("health_check_invalid_auth_id", phase=PHASE_SCRAPE, counter_id=counter.get("id"))
+        return 3
     session = _build_session()
     try:
         payload = fetch_one(counter, session, PER_COUNTER_DEADLINE)

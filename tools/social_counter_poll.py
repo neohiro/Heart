@@ -67,7 +67,10 @@ def _load_keys() -> dict[str, dict[str, str]]:
     try:
         import yaml  # type: ignore
         data = yaml.safe_load(LINKS_SECRET.read_text(encoding="utf-8"))
-        return data or {}
+        if not isinstance(data, dict):
+            LOG.warning("secrets_not_dict", phase=PHASE_SOCIAL, got_type=type(data).__name__)
+            return {}
+        return data
     except Exception as exc:  # noqa: BLE001
         LOG.warning("secrets_parse_failed", phase=PHASE_SOCIAL, error=str(exc))
         return {}
@@ -272,15 +275,16 @@ def health_check() -> int:
         ("Instagram", lambda: poll_instagram(session, keys)),
         ("Twitch", lambda: poll_twitch(session, keys)),
     ]
-    for name, poll_fn in platforms:
-        result = poll_fn()
-        if result:
-            LOG.info("health_check_ok", phase=PHASE_SOCIAL, platform=name, keys=len(result))
-            session.close()
-            return 0
-    LOG.error("health_check_no_platforms", phase=PHASE_SOCIAL)
-    session.close()
-    return 2
+    try:
+        for name, poll_fn in platforms:
+            result = poll_fn()
+            if result:
+                LOG.info("health_check_ok", phase=PHASE_SOCIAL, platform=name, keys=len(result))
+                return 0
+        LOG.error("health_check_no_platforms", phase=PHASE_SOCIAL)
+        return 2
+    finally:
+        session.close()
 
 
 def main(argv: list[str] | None = None) -> int:
