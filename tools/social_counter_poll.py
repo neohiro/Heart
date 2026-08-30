@@ -140,22 +140,38 @@ def poll_twitch(session: requests.Session, keys: dict) -> dict[str, Any]:
         logging.warning("%s: Twitch keys missing — skipping", PHASE_SOCIAL)
         return {}
 
-    # Get app access token (valid 60 days; short TTL here is fine)
+    # Get app access token via POST (OAuth 2.0 client credentials, not GET).
     token_url = "https://id.twitch.tv/oauth2/token"
-    token_data = {
+    form_data = {
         "client_id": client_id,
         "client_secret": client_secret,
         "grant_type": "client_credentials",
     }
-    token_resp = _fetch_json(session, token_url, {}, token_data)
-    if not token_resp:
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            token_resp = session.post(token_url, data=form_data, timeout=REQUEST_TIMEOUT)
+            token_resp.raise_for_status()
+            break
+        except requests.RequestException as exc:
+            logging.warning("%s: Twitch token attempt %d/%d failed: %s", PHASE_SOCIAL, attempt, MAX_RETRIES, exc)
+        except ValueError as exc:
+            logging.warning("%s: Twitch token non-JSON response: %s", PHASE_SOCIAL, exc)
+    else:
         return {}
-    access_token = token_resp.get("access_token", "")
+
+    try:
+        token_data = token_resp.json()
+    except ValueError:
+        logging.warning("%s: Twitch token JSON parse failed", PHASE_SOCIAL)
+        return {}
+
+    access_token = token_data.get("access_token", "")
     if not access_token:
+        logging.warning("%s: Twitch token response missing access_token", PHASE_SOCIAL)
         return {}
 
     headers = {"Client-Id": client_id, "Authorization": f"Bearer {access_token}"}
-    url = f"https://api.twitch.tv/helix/channels/followers"
+    url = "https://api.twitch.tv/helix/channels/followers"
     params = {"broadcaster_id": broadcaster_id}
     data = _fetch_json(session, url, headers, params)
     if not data:
@@ -170,7 +186,11 @@ def write_output(name: str, payload: dict) -> None:
     SOCIAL_DIR.mkdir(parents=True, exist_ok=True)
     path = SOCIAL_DIR / f"{name}.json"
     out = {**payload, "updated_at": _now_iso()}
-    path.write_text(json.dumps(out, indent=2), encoding="utf-8")
+    # Atomic write: temp + rename. Survives partial writes if the process
+    # crashes mid-write — readers always see either the old or new file.
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(out, indent=2), encoding="utf-8")
+    tmp.replace(path)
     logging.info("%s: wrote %s", PHASE_PUBLISH, path)
 
 
@@ -179,7 +199,7 @@ def run_once(args: argparse.Namespace) -> int:
     session = requests.Session()
     session.headers["User-Agent"] = "neohiro-Heart/1.0 (+https://neohiro.github.io)"
 
-    results = {}
+    results: dict[str, dict] = {}
     results["youtube"] = poll_youtube(session, keys)
     results["x"] = poll_x(session, keys)
     results["instagram"] = poll_instagram(session, keys)
@@ -189,11 +209,16 @@ def run_once(args: argparse.Namespace) -> int:
         if payload:
             write_output(name, payload)
 
-    if not any(results.values()):
+    successes = sum(1 for v in results.values() if v)
+    failures = len(results) - successes
+    if successes == 0:
         logging.error("%s: all platforms failed", PHASE_SOCIAL)
         return 3
-
-    successes = sum(1 for v in results.values() if v)
+    if failures > 0:
+        # Partial failure: at least one platform is missing fresh data. Doctor's
+        # H-09 freshness check will surface this; we still exit 0 because the
+        # write side is non-critical and we don't want to over-pager.
+        logging.warning("%s: partial failure — %d/%d platforms succeeded", PHASE_SOCIAL, successes, len(results))
     logging.info("%s: complete — %d/%d platforms succeeded", PHASE_SOCIAL, successes, len(results))
     return 0
 

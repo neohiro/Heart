@@ -168,8 +168,9 @@ class TestTwitch:
         followers_resp.raise_for_status = MagicMock()
         followers_resp.json.return_value = {"total": 2048}
 
-        # Two calls: token exchange + followers.
-        session.get.side_effect = [token_resp, followers_resp]
+        # Token uses POST; followers uses GET. Match the call order precisely.
+        session.post.return_value = token_resp
+        session.get.return_value = followers_resp
         keys = {
             "twitch_client_id": "cid",
             "twitch_client_secret": "csec",
@@ -177,6 +178,9 @@ class TestTwitch:
         }
         result = poll_mod.poll_twitch(session, keys)
         assert result["followers"] == 2048
+        # Sanity: token went through POST with form data, followers via GET.
+        session.post.assert_called_once()
+        session.get.assert_called_once()
 
     def test_missing_key_skips(self, poll_mod):
         result = poll_mod.poll_twitch(MagicMock(), {"twitch_client_id": ""})
@@ -185,7 +189,8 @@ class TestTwitch:
     def test_token_failure_returns_empty(self, poll_mod):
         session = MagicMock()
         import requests
-        session.get.side_effect = requests.RequestException("auth down")
+        # Token acquisition uses POST; have it raise.
+        session.post.side_effect = requests.RequestException("auth down")
         keys = {
             "twitch_client_id": "cid",
             "twitch_client_secret": "csec",

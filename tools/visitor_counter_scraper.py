@@ -76,29 +76,35 @@ def load_registry() -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     pending: dict[str, Any] = {}
     with LINKS_SECRET.open("r", encoding="utf-8") as f:
-        for raw in f:
-            line = raw.strip()
-            if not line or line.startswith("#"):
-                continue
-            if line.startswith("- id:") or line.startswith("id:"):
-                # Flush previous entry if it had an auth_id
-                if pending.get("auth_id") and pending.get("display_id"):
-                    out.append(pending)
-                key, val = line.split(":", 1)
-                pending = {"id": val.strip().strip('"')}
-                continue
-            if line.startswith("display_id:"):
-                pending["display_id"] = line.split(":", 1)[1].strip().strip('"')
-            elif line.startswith("auth_id:"):
-                pending["auth_id"] = line.split(":", 1)[1].strip().strip('"')
-            elif line.startswith("label:"):
-                pending["label"] = line.split(":", 1)[1].strip().strip('"')
+        text = f.read()
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("- id:") or line.startswith("id:"):
+            # Flush previous entry if it had the required fields
+            if pending.get("auth_id") and pending.get("display_id"):
+                out.append(pending)
+            elif pending.get("id"):
+                # Incomplete entry — log and skip rather than silently dropping.
+                LOG.warning("%s: dropping incomplete entry for id=%r (missing auth_id/display_id)", PHASE_SCRAPE, pending.get("id"))
+            val = line.split(":", 1)[1].strip()
+            pending = {"id": val.strip('"')}
+            continue
+        if line.startswith("display_id:"):
+            pending["display_id"] = line.split(":", 1)[1].strip().strip('"')
+        elif line.startswith("auth_id:"):
+            pending["auth_id"] = line.split(":", 1)[1].strip().strip('"')
+        elif line.startswith("label:"):
+            pending["label"] = line.split(":", 1)[1].strip().strip('"')
     if pending.get("auth_id") and pending.get("display_id"):
         out.append(pending)
+    elif pending.get("id"):
+        LOG.warning("%s: dropping incomplete entry for id=%r (missing auth_id/display_id)", PHASE_SCRAPE, pending.get("id"))
     # Parse as proper YAML instead — fall back to yaml.safe_load for robustness.
     try:
         import yaml  # type: ignore
-        data = yaml.safe_load(LINKS_SECRET.read_text(encoding="utf-8"))
+        data = yaml.safe_load(text)
         if isinstance(data, list):
             return [d for d in data if d.get("auth_id") and d.get("display_id")]
     except Exception as exc:  # noqa: BLE001 — log and continue with the cheap parse
@@ -171,7 +177,11 @@ def write_datalayer(per_counter: list[dict[str, Any]]) -> None:
         ],
     }
     WORLDMAP_DATALAYER.parent.mkdir(parents=True, exist_ok=True)
-    WORLDMAP_DATALAYER.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    # Atomic write: temp + rename. Survives partial writes if the process
+    # crashes mid-write — readers always see either the old or new file.
+    tmp = WORLDMAP_DATALAYER.with_suffix(WORLDMAP_DATALAYER.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    tmp.replace(WORLDMAP_DATALAYER)
     LOG.info("%s: wrote %d countries to %s", PHASE_PUBLISH, len(payload["countries"]), WORLDMAP_DATALAYER)
 
 
@@ -191,7 +201,9 @@ def write_counters(per_counter: list[dict[str, Any]]) -> None:
         ],
     }
     DASHBOARD_COUNTERS.parent.mkdir(parents=True, exist_ok=True)
-    DASHBOARD_COUNTERS.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    tmp = DASHBOARD_COUNTERS.with_suffix(DASHBOARD_COUNTERS.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    tmp.replace(DASHBOARD_COUNTERS)
 
 
 def append_feed(per_counter: list[dict[str, Any]]) -> None:

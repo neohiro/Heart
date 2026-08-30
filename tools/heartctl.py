@@ -281,7 +281,7 @@ def _run_scopecmd(scope: str) -> int:
         return 3
     cmd = [sys.executable, str(script), "--quiet", "--once"]
     print(f"$ {' '.join(cmd)}")
-    result = subprocess.run(cmd, env=os.environ.copy())
+    result = subprocess.run(cmd, env=os.environ.copy(), check=False)
     return result.returncode
 
 
