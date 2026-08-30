@@ -206,6 +206,60 @@ class TestWriters:
             assert len(c["iso"]) == 2 or c["iso"] == "XX"
 
 
+# ── aggregate_countries (pure function) ──────────────────────────────────
+class TestAggregateCountries:
+    def test_basic_aggregation(self, scraper_mod):
+        per_counter = [
+            {"_id": "a", "countries": [{"iso": "US", "hits": 10}, {"iso": "DE", "hits": 5}]},
+            {"_id": "b", "countries": [{"iso": "US", "hits": 20}, {"iso": "FR", "hits": 7}]},
+        ]
+        totals, last_seen, ts = scraper_mod.aggregate_countries(per_counter, "2026-08-30T00:00:00Z")
+        assert totals == {"US": 30, "DE": 5, "FR": 7}
+        assert last_seen == {"US": "2026-08-30T00:00:00Z", "DE": "2026-08-30T00:00:00Z", "FR": "2026-08-30T00:00:00Z"}
+        assert ts == "2026-08-30T00:00:00Z"
+
+    def test_returns_sorted_by_hits(self, scraper_mod):
+        per_counter = [
+            {"_id": "a", "countries": [{"iso": "JP", "hits": 2}]},
+            {"_id": "b", "countries": [{"iso": "US", "hits": 100}]},
+            {"_id": "c", "countries": [{"iso": "DE", "hits": 50}]},
+        ]
+        totals, _, _ = scraper_mod.aggregate_countries(per_counter, "2026-08-30T00:00:00Z")
+        # dict insertion order in Python 3.7+ preserves insertion order.
+        # Sorting is done at write time in write_datalayer, not here.
+        assert totals == {"JP": 2, "US": 100, "DE": 50}
+
+    def test_null_and_missing_hits_treated_as_zero(self, scraper_mod):
+        per_counter = [
+            {"_id": "a", "countries": [
+                {"iso": "US", "hits": 10},
+                {"iso": "DE"},                    # missing hits
+                {"iso": "FR", "hits": None},    # explicit null
+            ]},
+        ]
+        totals, _, _ = scraper_mod.aggregate_countries(per_counter, "2026-08-30T00:00:00Z")
+        assert totals == {"US": 10, "DE": 0, "FR": 0}
+
+    def test_empty_per_counter_returns_empty(self, scraper_mod):
+        totals, last_seen, ts = scraper_mod.aggregate_countries([], "2026-08-30T00:00:00Z")
+        assert totals == {}
+        assert last_seen == {}
+
+    def test_missing_iso_skipped(self, scraper_mod):
+        per_counter = [
+            {"_id": "a", "countries": [{"iso": "US", "hits": 5}, {"hits": 10}]},
+        ]
+        totals, last_seen, _ = scraper_mod.aggregate_countries(per_counter, "2026-08-30T00:00:00Z")
+        assert totals == {"US": 5}
+        assert "XX" not in totals
+
+    def test_generates_timestamp_when_not_provided(self, scraper_mod):
+        _, _, ts = scraper_mod.aggregate_countries([], None)
+        # Should be a valid ISO string.
+        from datetime import datetime, timezone
+        datetime.fromisoformat(ts)
+
+
 # ── Failure tracking ─────────────────────────────────────────────────────
 class TestFailureTracking:
     def test_fail_counter_increments(self, scraper_mod):
@@ -261,24 +315,95 @@ class TestRunOnce:
         ok.json.return_value = {"hits": 10, "countries": [{"iso": "US", "hits": 10}]}
         session.get.return_value = ok
         args = MagicMock(); args.loop_seconds = 0
-        with patch.object(scraper_mod, "_load_session", return_value=session) if hasattr(scraper_mod, "_load_session") else patch("requests.Session", return_value=session):
+        with patch.object(scraper_mod, "_build_session", return_value=session):
             rc = scraper_mod.run_once(args)
         assert rc == 0
-        # The datalayer file should exist.
         assert scraper_mod.WORLDMAP_DATALAYER.exists()
+        # Event log should have an OK entry.
+        if scraper_mod.FAIL_EVENTS.exists():
+            lines = scraper_mod.FAIL_EVENTS.read_text(encoding="utf-8").strip().splitlines()
+            import json as _json
+            last = _json.loads(lines[-1])
+            assert last["ok"] is True
 
     def test_all_counters_fail_increments(self, scraper_mod):
         session = MagicMock()
         import requests
         session.get.side_effect = requests.RequestException("down")
         args = MagicMock(); args.loop_seconds = 0
-        # Reset fail counter.
         scraper_mod.bump_fail_counter(0)
         if scraper_mod.FAIL_COUNTER.exists():
             scraper_mod.FAIL_COUNTER.write_text("0", encoding="utf-8")
-        with patch("requests.Session", return_value=session):
+        with patch.object(scraper_mod, "_build_session", return_value=session):
             rc = scraper_mod.run_once(args)
         assert rc == 3
-        # Fail counter incremented.
         cur = int(scraper_mod.FAIL_COUNTER.read_text(encoding="utf-8").strip() or "0")
         assert cur >= 1
+        # Event log should have a FAIL entry.
+        if scraper_mod.FAIL_EVENTS.exists():
+            lines = scraper_mod.FAIL_EVENTS.read_text(encoding="utf-8").strip().splitlines()
+            import json as _json
+            last = _json.loads(lines[-1])
+            assert last["ok"] is False
+
+
+# ── Rolling event log ───────────────────────────────────────────────────
+class TestRollingEventLog:
+    def test_record_cycle_event_writes_ndjson_line(self, scraper_mod):
+        scraper_mod.record_cycle_event(ok=True)
+        lines = scraper_mod.FAIL_EVENTS.read_text(encoding="utf-8").strip().splitlines()
+        assert len(lines) == 1
+        import json as _json
+        rec = _json.loads(lines[0])
+        assert rec["ok"] is True
+        assert "ts" in rec
+        assert "fails" in rec
+
+    def test_record_cycle_event_false_flag(self, scraper_mod):
+        scraper_mod.record_cycle_event(ok=False)
+        lines = scraper_mod.FAIL_EVENTS.read_text(encoding="utf-8").strip().splitlines()
+        rec = json.loads(lines[-1])
+        assert rec["ok"] is False
+
+    def test_read_fail_window_returns_recent_events(self, scraper_mod):
+        scraper_mod.record_cycle_event(ok=True)
+        scraper_mod.record_cycle_event(ok=False)
+        events = scraper_mod.read_fail_window(window_s=3600)
+        assert len(events) == 2
+        assert events[0]["ok"] is True
+        assert events[1]["ok"] is False
+
+    def test_read_fail_window_drops_old_events(self, scraper_mod):
+        # Write a fake old event directly into the log (must create parent dir first).
+        scraper_mod.FAIL_EVENTS.parent.mkdir(parents=True, exist_ok=True)
+        old = {"ts": "2020-01-01T00:00:00Z", "ok": False, "fails": 99}
+        with scraper_mod.FAIL_EVENTS.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(old) + "\n")
+        # Fresh event.
+        scraper_mod.record_cycle_event(ok=True)
+        events = scraper_mod.read_fail_window(window_s=3600)
+        # Only the fresh event should be in the window.
+        assert all(e["ts"] != "2020-01-01T00:00:00Z" for e in events)
+
+    def test_read_fail_window_drops_malformed_lines(self, scraper_mod):
+        scraper_mod.FAIL_EVENTS.parent.mkdir(parents=True, exist_ok=True)
+        with scraper_mod.FAIL_EVENTS.open("a", encoding="utf-8") as f:
+            f.write("not json\n")
+            f.write('{"ts": "2030-01-01T00:00:00Z"}\n')  # missing ok
+            f.write(json.dumps({"ts": "2030-01-01T00:00:00Z", "ok": True}) + "\n")
+        events = scraper_mod.read_fail_window(window_s=3600)
+        # Only the well-formed third line should survive.
+        assert len(events) == 1
+        assert events[0]["ok"] is True
+
+    def test_read_fail_window_empty_file(self, scraper_mod):
+        scraper_mod.FAIL_EVENTS.parent.mkdir(parents=True, exist_ok=True)
+        scraper_mod.FAIL_EVENTS.write_text("", encoding="utf-8")
+        events = scraper_mod.read_fail_window(window_s=3600)
+        assert events == []
+
+    def test_read_fail_window_missing_file(self, scraper_mod):
+        if scraper_mod.FAIL_EVENTS.exists():
+            scraper_mod.FAIL_EVENTS.unlink()
+        events = scraper_mod.read_fail_window(window_s=3600)
+        assert events == []

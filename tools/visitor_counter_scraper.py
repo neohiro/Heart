@@ -49,11 +49,24 @@ LINKS_SECRET = Path(
 )
 
 REQUEST_TIMEOUT = 8.0
+# Per-counter wall-clock budget. Two attempts (each ≤REQUEST_TIMEOUT) plus a
+# small overhead must fit inside this, or we abandon the counter and move on.
+# Worst case for 12 counters then becomes 12 × PER_COUNTER_DEADLINE, not
+# 12 × MAX_RETRIES × REQUEST_TIMEOUT, so a single degraded vendor can't
+# stall the next 5-min cycle.
+PER_COUNTER_DEADLINE = 4.0
 MAX_RETRIES = 2
 
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _build_session() -> requests.Session:
+    """One Session per process; connection-pooled, single User-Agent."""
+    s = requests.Session()
+    s.headers["User-Agent"] = "neohiro-Heart/1.0 (+https://neohiro.github.io)"
+    return s
 
 
 def load_registry() -> list[dict[str, Any]]:
@@ -111,17 +124,35 @@ def load_registry() -> list[dict[str, Any]]:
     return [c for c in out if c.get("auth_id") and c.get("display_id")]
 
 
-def fetch_one(counter: dict[str, Any], session: requests.Session) -> dict[str, Any] | None:
+def fetch_one(
+    counter: dict[str, Any],
+    session: requests.Session,
+    deadline_s: float = PER_COUNTER_DEADLINE,
+) -> dict[str, Any] | None:
     """Hit the vendor's auth endpoint for a single counter.
 
     Returns the parsed payload or None on failure. Errors include the phase
     name and counter ID so /doctor can route them.
+
+    The full retry budget is bounded by `deadline_s` so a single counter
+    can never consume more wall-clock than that, regardless of how many
+    individual timeouts occur.
     """
+    import time as _time
     auth_id = counter["auth_id"]
     url = f"{DEFAULT_VENDOR_AUTH}?id={auth_id}"
+    deadline = _time.monotonic() + deadline_s
+    last_exc: str = ""
     for attempt in range(1, MAX_RETRIES + 1):
+        remaining = deadline - _time.monotonic()
+        if remaining <= 0:
+            LOG.warning(
+                "%s: counter %s deadline %ss exhausted (last: %s)",
+                PHASE_SCRAPE, counter["id"], deadline_s, last_exc,
+            )
+            return None
         try:
-            r = session.get(url, timeout=REQUEST_TIMEOUT)
+            r = session.get(url, timeout=(min(remaining, REQUEST_TIMEOUT), REQUEST_TIMEOUT))
             r.raise_for_status()
             payload = r.json()
             payload["_id"] = counter["id"]
@@ -129,16 +160,44 @@ def fetch_one(counter: dict[str, Any], session: requests.Session) -> dict[str, A
             payload["_fetched_at"] = _now_iso()
             return payload
         except requests.RequestException as exc:
+            last_exc = f"{type(exc).__name__}: {exc}"
             LOG.warning(
                 "%s: counter %s attempt %d/%d failed: %s",
                 PHASE_SCRAPE, counter["id"], attempt, MAX_RETRIES, exc,
             )
         except ValueError as exc:
+            last_exc = f"{type(exc).__name__}: {exc}"
             LOG.warning(
                 "%s: counter %s returned non-JSON (attempt %d): %s",
                 PHASE_SCRAPE, counter["id"], attempt, exc,
             )
     return None
+
+
+def aggregate_countries(
+    per_counter: list[dict[str, Any]],
+    now: str | None = None,
+) -> tuple[dict[str, int], dict[str, str], str]:
+    """Pure aggregation: roll up per-counter country hits into totals.
+
+    Returns (country_totals, last_seen, timestamp) where:
+      country_totals — {iso: total_hits}
+      last_seen    — {iso: last_seen_ts}  (all set to `now`)
+      timestamp    — the `now` value used (ISO or generated)
+
+    No I/O, no filesystem access. Fully testable in isolation.
+    """
+    ts = now or _now_iso()
+    country_totals: dict[str, int] = {}
+    last_seen: dict[str, str] = {}
+    for c in per_counter:
+        for country in c.get("countries", []):
+            iso = country.get("iso")
+            if not iso:
+                continue
+            country_totals[iso] = country_totals.get(iso, 0) + int(country.get("hits") or 0)
+            last_seen[iso] = ts
+    return country_totals, last_seen, ts
 
 
 def write_datalayer(per_counter: list[dict[str, Any]]) -> None:
@@ -154,18 +213,7 @@ def write_datalayer(per_counter: list[dict[str, Any]]) -> None:
           ]
         }
     """
-    country_totals: dict[str, int] = {}
-    last_seen: dict[str, str] = {}
-    now = _now_iso()
-
-    for c in per_counter:
-        for country in c.get("countries", []):
-            iso = country.get("iso")
-            if not iso:
-                continue
-            country_totals[iso] = country_totals.get(iso, 0) + int(country.get("hits") or 0)
-            last_seen[iso] = now
-
+    country_totals, last_seen, now = aggregate_countries(per_counter)
     payload = {
         "layer": "visitors",
         "updated_at": now,
@@ -238,26 +286,85 @@ def bump_fail_counter(delta: int) -> int:
     return new_val
 
 
+FAIL_EVENTS = SHARED_ROOT / "brain" / "heart" / "visitor-counter.events.ndjson"
+FAIL_WINDOW_SECONDS = 30 * 60
+
+
+def record_cycle_event(ok: bool) -> None:
+    """Append a per-cycle outcome to the rolling audit log.
+
+    Each line is `{"ts": "<iso>", "ok": true|false, "fails": N}`. Doctor H-08
+    reads this with a 30-min window so it can surface rate-based findings
+    ("3 fails in 7 min") rather than the current-snapshot counter.
+    """
+    FAIL_EVENTS.parent.mkdir(parents=True, exist_ok=True)
+    row = {
+        "ts": _now_iso(),
+        "ok": bool(ok),
+        # Read current counter so the log carries the streak at that point.
+        "fails": int(FAIL_COUNTER.read_text(encoding="utf-8").strip() or "0")
+                if FAIL_COUNTER.exists() else 0,
+    }
+    with FAIL_EVENTS.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(row) + "\n")
+
+
+def read_fail_window(window_s: int = FAIL_WINDOW_SECONDS) -> list[dict[str, Any]]:
+    """Read cycle events from the last `window_s` seconds.
+
+    Returns a list of {ts, ok, fails} dicts in chronological order.
+    Drops malformed lines silently — they're audit data, not user input.
+    """
+    if not FAIL_EVENTS.exists():
+        return []
+    cutoff = datetime.now(timezone.utc).timestamp() - window_s
+    out: list[dict[str, Any]] = []
+    for raw in FAIL_EVENTS.read_text(encoding="utf-8").splitlines():
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            row = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if "ts" not in row or "ok" not in row:
+            # Malformed line: required fields missing.
+            continue
+        try:
+            ts = datetime.fromisoformat(row["ts"].replace("Z", "+00:00"))
+        except (KeyError, ValueError):
+            continue
+        if ts.timestamp() < cutoff:
+            continue
+        out.append(row)
+    return out
+
+
 def run_once(args: argparse.Namespace) -> int:
     registry = load_registry()
     if not registry:
         LOG.error("%s: registry empty or missing — aborting cycle", PHASE_SCRAPE)
         bump_fail_counter(1)
+        record_cycle_event(ok=False)
         return 2
 
-    session = requests.Session()
-    results: list[dict[str, Any]] = []
-    failures = 0
-    for counter in registry:
-        payload = fetch_one(counter, session)
-        if payload is None:
-            failures += 1
-            continue
-        results.append(payload)
+    session = _build_session()
+    try:
+        results: list[dict[str, Any]] = []
+        failures = 0
+        for counter in registry:
+            payload = fetch_one(counter, session, PER_COUNTER_DEADLINE)
+            if payload is None:
+                failures += 1
+                continue
+            results.append(payload)
+    finally:
+        session.close()
 
     if not results:
         LOG.error("%s: every counter failed (failures=%d)", PHASE_DEGRADED, failures)
         bump_fail_counter(1)
+        record_cycle_event(ok=False)
         return 3
 
     try:
@@ -267,12 +374,14 @@ def run_once(args: argparse.Namespace) -> int:
     except OSError as exc:
         LOG.error("%s: publish failed: %s", PHASE_PUBLISH, exc)
         bump_fail_counter(1)
+        record_cycle_event(ok=False)
         return 4
 
     # Successful cycle — reset fail counter.
     if failures:
         LOG.warning("%s: %d/%d counters failed but at least one succeeded", PHASE_DEGRADED, failures, len(registry))
     bump_fail_counter(0)
+    record_cycle_event(ok=True)
     LOG.info("%s: cycle complete — %d/%d counters", PHASE_SCRAPE, len(results), len(registry))
     return 0
 
