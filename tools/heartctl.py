@@ -9,23 +9,27 @@ Usage:
     python heartctl.py <command> [flags]
 
 Commands:
-    status      — show current heartbeat state (mode, last run, health, repos)
-    mode        — get or set the current cadence mode
-    repos       — list all known repos from Brain/_entities + repos.yaml
-    audit       — show recent audit entries
-    health      — show latest health metrics
-    phase       — run a single phase and print JSON result
-    trigger     — trigger a single Heart cycle (calls heart.py --once)
-    watch       — tail the audit log in real time
-    doctor      — run neohiro-doctor checks and print report
-    env-check   — verify all required environment variables are set
+    status              — show current heartbeat state (mode, last run, health, repos)
+    mode                — get or set the current cadence mode
+    repos               — list all known repos from Brain/_entities + repos.yaml
+    audit               — show recent audit entries
+    health              — show latest health metrics
+    phase               — run a single phase and print JSON result
+    trigger             — trigger a single Heart cycle (calls heart.py --once)
+    watch               — tail the audit log in real time
+    doctor              — run neohiro-doctor checks and print report
+    env-check           — verify all required environment variables are set
+    visitor-counters    — run a single visitor_counter_scraper cycle
+    social-counters     — run a single social_counter_poll cycle
 
 Environment:
-    BRAIN_PATH       Root of /Brain (default: /brain)
-    GH_TOKEN         GitHub PAT
-    HEART_LOG_LEVEL  debug|info|warn|error
-    NEWS_PATH        Root of neohiro/news (default: /news)
-    CC_PATH          Root of frenzypenguin-media/Content-Creator (default: /content-creator)
+    BRAIN_PATH              Root of /Brain (default: /brain)
+    GH_TOKEN                GitHub PAT
+    HEART_LOG_LEVEL         debug|info|warn|error
+    NEWS_PATH               Root of neohiro/news (default: /news)
+    CC_PATH                 Root of frenzypenguin-media/Content-Creator (default: /content-creator)
+    NEOHIRO_SHARED_ROOT     Root of /shared (default: /shared)
+    NEOHIRO_LINKS_SECRET    Path to links-secret YAML (default: /links-secret/<file>)
 """
 
 from __future__ import annotations
@@ -261,6 +265,38 @@ def cmd_env_check(_args: argparse.Namespace) -> int:
     return 0 if all_ok else 1
 
 
+def _run_scopecmd(scope: str) -> int:
+    """Run a single populator-script cycle and propagate its return code."""
+    script_dir = Path(__file__).parent
+    candidates = {
+        "visitor-counters": script_dir / "visitor_counter_scraper.py",
+        "social-counters":  script_dir / "social_counter_poll.py",
+    }
+    if scope not in candidates:
+        print(f"unknown scope: {scope}", file=sys.stderr)
+        return 2
+    script = candidates[scope]
+    if not script.is_file():
+        print(f"script not found: {script}", file=sys.stderr)
+        return 3
+    cmd = [sys.executable, str(script), "--quiet", "--once"]
+    print(f"$ {' '.join(cmd)}")
+    result = subprocess.run(cmd, env=os.environ.copy())
+    return result.returncode
+
+
+def cmd_visitor_counters(_args: argparse.Namespace) -> int:
+    """Run one visitor_counter_scraper.py cycle and print the result."""
+    print("=== Heart visitor-counter scope ===")
+    return _run_scopecmd("visitor-counters")
+
+
+def cmd_social_counters(_args: argparse.Namespace) -> int:
+    """Run one social_counter_poll.py cycle and print the result."""
+    print("=== Heart social-counter scope ===")
+    return _run_scopecmd("social-counters")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="heartctl — Heart cadence engine control interface")
     parser.add_argument("--brain-path", default=os.environ.get("BRAIN_PATH", "/brain"), help="Root of /Brain")
@@ -290,6 +326,15 @@ def main() -> int:
 
     sub.add_parser("env-check", help="verify environment variables")
 
+    sub.add_parser(
+        "visitor-counters",
+        help="run one visitor_counter_scraper.py cycle (see Heart/schedules/REGISTRY.yaml)",
+    )
+    sub.add_parser(
+        "social-counters",
+        help="run one social_counter_poll.py cycle (see Heart/schedules/REGISTRY.yaml)",
+    )
+
     args = parser.parse_args()
     global BRAIN_PATH
     BRAIN_PATH = Path(args.brain_path)
@@ -308,6 +353,8 @@ def main() -> int:
         "watch": cmd_watch,
         "doctor": cmd_doctor,
         "env-check": cmd_env_check,
+        "visitor-counters": cmd_visitor_counters,
+        "social-counters": cmd_social_counters,
     }
     return commands[args.command](args)
 

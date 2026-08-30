@@ -1,0 +1,30 @@
+# Heart — gitignore
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.pytest_cache/v
+*.egg-info/
+
+# Local state / runs
+data/ghosts/
+tools/static/heartbeat.html
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+
+# Logs
+*.log
+logs/
+
+# Build artifacts
+heart-test.exe
+dist/
+build/

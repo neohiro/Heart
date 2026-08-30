@@ -74,22 +74,27 @@ def load_registry() -> list[dict[str, Any]]:
         LOG.error("%s missing — no scrape IDs available", LINKS_SECRET)
         return []
     out: list[dict[str, Any]] = []
+    pending: dict[str, Any] = {}
     with LINKS_SECRET.open("r", encoding="utf-8") as f:
         for raw in f:
             line = raw.strip()
-            if not line or line.startswith("#") or line.startswith("-"):
-                # crude; we read the whole block under each '- id:' below
+            if not line or line.startswith("#"):
                 continue
-            if line.startswith("id:"):
-                # reset accumulator
-                out.append({"id": line.split(":", 1)[1].strip()})
+            if line.startswith("- id:") or line.startswith("id:"):
+                # Flush previous entry if it had an auth_id
+                if pending.get("auth_id") and pending.get("display_id"):
+                    out.append(pending)
+                key, val = line.split(":", 1)
+                pending = {"id": val.strip().strip('"')}
                 continue
             if line.startswith("display_id:"):
-                out[-1]["display_id"] = line.split(":", 1)[1].strip().strip('"')
+                pending["display_id"] = line.split(":", 1)[1].strip().strip('"')
             elif line.startswith("auth_id:"):
-                out[-1]["auth_id"] = line.split(":", 1)[1].strip().strip('"')
+                pending["auth_id"] = line.split(":", 1)[1].strip().strip('"')
             elif line.startswith("label:"):
-                out[-1]["label"] = line.split(":", 1)[1].strip().strip('"')
+                pending["label"] = line.split(":", 1)[1].strip().strip('"')
+    if pending.get("auth_id") and pending.get("display_id"):
+        out.append(pending)
     # Parse as proper YAML instead — fall back to yaml.safe_load for robustness.
     try:
         import yaml  # type: ignore
@@ -212,9 +217,14 @@ def bump_fail_counter(delta: int) -> int:
             cur = int(FAIL_COUNTER.read_text(encoding="utf-8").strip() or "0")
         except ValueError:
             cur = 0
-    cur = max(0, cur + delta)
-    FAIL_COUNTER.write_text(str(cur), encoding="utf-8")
-    return cur
+    if delta == 0 and cur > 0:
+        # Explicit reset on success.
+        FAIL_COUNTER.write_text("0", encoding="utf-8")
+        return 0
+    new_val = max(0, cur + delta)
+    if new_val != cur:
+        FAIL_COUNTER.write_text(str(new_val), encoding="utf-8")
+    return new_val
 
 
 def run_once(args: argparse.Namespace) -> int:
