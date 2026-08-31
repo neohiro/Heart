@@ -30,24 +30,11 @@ from typing import Any
 import requests
 import structlog
 
-def _drop_none(logger, method, event_dict):
-    """Filter None values from structlog events to reduce log noise."""
-    return {k: v for k, v in event_dict.items() if v is not None}
+from _structlog import configure_logger
 
-
-LOG = structlog.get_logger("heart.visitor_counter_scraper")
-
-# Configure structlog to route through stdlib logging so caplog + log aggregators
-# see the events. Idempotent: repeated imports are no-ops via already_configured.
-structlog.configure(
-    processors=[
-        _drop_none,
-        structlog.processors.KeyValueRenderer(
-            key_order=["event", "phase", "counter_id", "error"],
-        ),
-    ],
-    wrapper_class=structlog.stdlib.BoundLogger,
-    logger_factory=structlog.stdlib.LoggerFactory(),
+LOG = configure_logger(
+    "heart.visitor_counter_scraper",
+    key_order=["event", "phase", "counter_id", "error"],
 )
 
 # Phase names — every emitted log line + error must include one of these.

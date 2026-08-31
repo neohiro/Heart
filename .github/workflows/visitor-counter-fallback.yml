@@ -26,7 +26,10 @@ jobs:
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install pytest requests pyyaml
+          pip install pytest ruff requests pyyaml
+
+      - name: Lint owned files (BLE blind-except)
+        run: ruff check tools/visitor_counter_scraper.py tools/social_counter_poll.py tools/_structlog.py tests/test_visitor_counter_scraper.py tests/test_social_counter_poll.py tests/test_structlog.py --select=BLE
 
       - name: Run tests with strict-markers
         run: python -m pytest tests/test_visitor_counter_scraper.py --strict-markers -q
