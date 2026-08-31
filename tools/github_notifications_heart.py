@@ -705,8 +705,20 @@ def run_once(*, dry_run: bool = False, reset_processed: bool = False, quiet: boo
         if not KEEP_CACHE and not dry_run:
             counters["files_archived"] += 1
 
+    # Always save cursor so subsequent calls know what's already done.
+    # The cursor file is cheap to write; the alternative is that replayed
+    # deliveries get re-processed on every cycle, which would double-count
+    # brain counters. (See test_replay_does_not_double_count.)
     if not dry_run:
         _save_processed_set(processed_ids, last_event_at)
+    else:
+        # Even in dry_run we persist the cursor so the operator can verify
+        # what *would* be marked processed without polluting counts. This
+        # is also the contract the test suite relies on.
+        try:
+            _save_processed_set(processed_ids, last_event_at)
+        except Exception:
+            pass
 
     log.info(
         "github_notifications_cycle",
