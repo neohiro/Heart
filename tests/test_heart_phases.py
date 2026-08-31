@@ -19,6 +19,36 @@ ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(ROOT / "Heart" / "tools"))
 
 
+def _reload_heart():
+    """Re-import Heart.tools.heart with a clean module cache, return the fresh module.
+
+    Used by tests that read heart's source (docstrings, run_cycle, etc.) so a
+    prior test's monkeypatch of env vars doesn't leak into the new source.
+    """
+    import importlib
+    for k in list(sys.modules.keys()):
+        if "heart" in k:
+            del sys.modules[k]
+    import Heart.tools.heart as h
+    importlib.reload(h)
+    return h
+
+
+def _resolve_heart_source() -> Path:
+    """Return the Path to heart.py source via a fresh reload."""
+    return Path(_reload_heart().__file__).resolve()
+
+
+def _phase_names_from_run_cycle() -> list[str]:
+    """Extract phase names from run_cycle() source via a fresh reload."""
+    import inspect
+    h = _reload_heart()
+    src = inspect.getsource(h.run_cycle)
+    lines = src.splitlines()
+    phase_lines = [l.strip() for l in lines if l.strip().startswith('("') and "_phase_" in l]
+    return [l.split('"')[1] for l in phase_lines if '"' in l]
+
+
 @pytest.fixture
 def heart_mod(tmp_path, monkeypatch):
     """Import heart with a clean temporary workspace."""
@@ -37,6 +67,30 @@ def heart_mod(tmp_path, monkeypatch):
 
 
 class TestPhaseListIntegrity:
+    def test_module_docstring_phase_list_matches_run_cycle(self):
+        """The 'Phases (in order):' block in heart.py's module docstring must list every
+        phase in run_cycle (and only those phases), in the same order. Locks in
+        docstring/code parity so a new phase added to run_cycle without updating the
+        docstring (or vice versa) fails this test instead of being silently out of date.
+        """
+        import re
+        text = _resolve_heart_source().read_text(encoding="utf-8")
+
+        m = re.search(r"Phases \(in order\):\n(.*?)\n\s*\n", text, re.DOTALL)
+        assert m, "module docstring has no 'Phases (in order):' block"
+        block = m.group(1)
+        doc_names = re.findall(r"^\s*([a-z_]+)\s*[\u2014\-]", block, re.MULTILINE)
+        doc_names = [n for n in doc_names if n.replace("_", "").isalnum()]
+
+        code_names = _phase_names_from_run_cycle()
+        assert doc_names == code_names, (
+            f"module docstring phase list must match run_cycle.\n"
+            f"  doc:     {doc_names}\n"
+            f"  run:     {code_names}\n"
+            f"  only-doc: {set(doc_names) - set(code_names)}\n"
+            f"  only-run: {set(code_names) - set(doc_names)}"
+        )
+
     def test_osint_userdata_in_cycle_phases(self, heart_mod):
         """osint_userdata must be in the phases list between ingest_osint and compute_health."""
         import inspect
@@ -177,6 +231,55 @@ class TestPruneStaleAndSelfHeal:
         r2 = heart_mod._phase_prune_stale(state)
         assert r1.ok is True
         assert r2.ok is True
+
+    def test_prune_stale_does_not_mutate_cache_in_dry_run(self, heart_mod, monkeypatch):
+        """prune_stale must not write osint_cache.json when HEART_DRY_RUN=1, but still count.
+
+        Regression test: before the fix, prune_and_save always called save() regardless
+        of dry-run mode, so --dry-run and sandboxed tests would silently mutate the cache.
+        """
+        import os
+        from Heart.tools.heart import CycleState
+
+        cache_file = heart_mod.BRAIN_PATH / "heartbeat" / "osint_cache.json"
+        cache_file.parent.mkdir(parents=True, exist_ok=True)
+        cache_file.write_text(
+            '{"version": 1, "generated_at": "2025-01-01T00:00:00Z", '
+            '"observations": {"dead": {"last_seen": "2020-01-01T00:00:00Z", "country": "XX"}}}',
+            encoding="utf-8",
+        )
+        original_mtime = cache_file.stat().st_mtime
+
+        monkeypatch.setenv("HEART_DRY_RUN", "1")
+        state = CycleState()
+        state.cycle = 1
+        result = heart_mod._phase_prune_stale(state)
+
+        assert result.ok is True
+        assert cache_file.stat().st_mtime == original_mtime, (
+            "osint_cache.json must not be modified in dry-run mode"
+        )
+
+        # Replace cache and record its mtime BEFORE prune_and_save runs.
+        # prune_and_save uses _atomic_write (tmp+rename), which always updates mtime.
+        # We assert the mtime advances past this baseline after the save.
+        os.unlink(str(cache_file))
+        cache_file.write_text(
+            '{"version": 1, "generated_at": "2025-01-01T00:00:00Z", '
+            '"observations": {"dead2": {"last_seen": "2019-01-01T00:00:00Z"}}, '
+            '"pruned": 0}',
+            encoding="utf-8",
+        )
+        before_save_mtime = cache_file.stat().st_mtime
+        monkeypatch.setenv("HEART_DRY_RUN", "0")
+
+        result2 = heart_mod._phase_prune_stale(state)
+        assert result2.ok is True
+        after_save_mtime = cache_file.stat().st_mtime
+        assert after_save_mtime > before_save_mtime, (
+            "osint_cache.json must be written (mtime advanced) when HEART_DRY_RUN=0; "
+            f"before={before_save_mtime}, after={after_save_mtime}"
+        )
 
     def test_self_heal_returns_phase_result(self, heart_mod):
         from Heart.tools.heart import CycleState
@@ -552,6 +655,45 @@ class TestPruneShared:
         assert not large.exists(), "largest file should be pruned first"
         assert small.exists(), "smaller file survives (budget exhausted)"
 
+    def test_prune_largest_first_caps_at_budget(self, heart_mod, monkeypatch):
+        """When budget is exhausted, pruning stops even if more files remain.
+
+        Largest-first: with files [100, 200, 300, 400, 500] and budget=250,
+        sorted order is [500, 400, 300, 200, 100]. First file (500) exceeds
+        budget immediately, so only 1 file is pruned and we stop.
+        """
+        import shutil
+        from Heart.tools.heart import CycleState
+
+        prune_dir = heart_mod.BRAIN_PATH.parent / "heartbeat" / "signals_incoming"
+        prune_dir.mkdir(parents=True, exist_ok=True)
+        file_sizes = [100, 200, 300, 400, 500]
+        files = []
+        for i, sz in enumerate(file_sizes):
+            f = prune_dir / f"file_{i}.bin"
+            f.write_bytes(b"x" * sz)
+            files.append(f)
+
+        def fake_usage(path):
+            class _FU:
+                total = 1 * 1024 ** 3
+                used = 950 * 1024 ** 2
+                free = 50 * 1024 ** 2
+            return _FU()
+        monkeypatch.setattr("shutil.disk_usage", fake_usage)
+        monkeypatch.setenv("HEART_SHARED_PRUNE_BUDGET", "250")
+
+        result = heart_mod._phase_prune_shared(CycleState())
+        assert result.ok is True
+
+        deleted = [f for f in files if not f.exists()]
+        surviving = [f for f in files if f.exists()]
+        # Largest-first: 500 is pruned first, bytes_pruned=500 >= 250 -> stop
+        assert len(deleted) == 1, f"budget=250: expected 1 deleted (500), got {len(deleted)}"
+        assert len(surviving) == 4
+        assert not files[4].exists(), "largest file (500) must be pruned"
+        assert files[3].exists(), "second-largest (400) must survive (budget exhausted)"
+
     def test_disabled_via_env(self, heart_mod, monkeypatch):
         """HEART_SHARED_PRUNE_ENABLED=0 must disable pruning entirely."""
         import shutil
@@ -600,6 +742,54 @@ class TestPruneShared:
         assert (userdata_dir / "ghost.json").exists(), "userdata files must never be pruned"
         assert (audit_dir / "audit.json").exists(), "audit files must never be pruned"
         assert not (signals_dir / "big.bin").exists(), "signals_incoming files are in safe_subtrees and must be pruned"
+
+    def test_prune_largest_first_skips_symlinked_dirs_outside_subtree(self, heart_mod, monkeypatch):
+        """Symlinks inside safe_subtrees that point outside must NOT be followed.
+
+        Regression: if prune_largest_first used os.path.isdir without follow_symlinks=False,
+        a symlink-to-dir would be recursed into, potentially deleting files outside the
+        safe subtree. The fix uses os.scandir with follow_symlinks=False on both is_file
+        and is_dir checks so symlinks are treated as files (size of the link target is not
+        stat()'ed) and never followed.
+        """
+        import shutil
+        from Heart.tools.heart import CycleState
+
+        # Create a file outside the safe subtree that we must protect
+        external_dir = heart_mod.BRAIN_PATH.parent / "external"
+        external_dir.mkdir(parents=True)
+        protected_file = external_dir / "must_not_delete.txt"
+        protected_file.write_bytes(b"critical data")
+
+        # Inside the safe subtree, create a symlink pointing to the external file's directory
+        prune_dir = heart_mod.BRAIN_PATH.parent / "heartbeat" / "signals_incoming"
+        prune_dir.mkdir(parents=True)
+        link_to_external = prune_dir / "link_to_external"
+        try:
+            link_to_external.symlink_to(external_dir)
+        except (OSError, NotImplementedError):
+            # On Windows without dev mode or admin, symlink creation fails; skip test
+            return
+
+        # Also create a regular file inside the safe subtree so budget is exceeded
+        regular_file = prune_dir / "regular.json"
+        regular_file.write_bytes(b"x" * 1024)
+
+        def fake_usage(path):
+            class _FU:
+                total = 1 * 1024 ** 3
+                used = 950 * 1024 ** 2
+                free = 50 * 1024 ** 2
+            return _FU()
+        monkeypatch.setattr("shutil.disk_usage", fake_usage)
+        monkeypatch.setenv("HEART_SHARED_PRUNE_BUDGET", "512")  # < 1024 so at least one file pruned
+
+        result = heart_mod._phase_prune_shared(CycleState())
+        assert result.ok is True
+
+        # The symlink itself (as a file) may be pruned, but the target must be intact
+        assert protected_file.exists(), "external file must not be deleted via symlink recursion"
+        assert protected_file.read_bytes() == b"critical data", "external file must be unmodified"
 
     def test_writes_shared_prune_audit(self, heart_mod, monkeypatch):
         """When triggered, prune_shared must append to shared_prune.yaml."""
@@ -991,3 +1181,185 @@ class TestPruneShared:
         # No file should be created outside queue_dir.
         outside = heart_mod.BRAIN_PATH / "etc" / "passwd"
         assert not outside.exists()
+
+
+# ── Atomic write helpers ──────────────────────────────────────────────────────
+
+class TestAtomicWriteHelpers:
+    """Unit tests for _atomic_write_json, _atomic_write_yaml, _atomic_write_text."""
+
+    def test_atomic_write_json_creates_file(self, heart_mod, tmp_path):
+        path = tmp_path / "test.json"
+        heart_mod._atomic_write_json(path, {"key": "value", "num": 42})
+        assert path.exists()
+        import json
+        assert json.loads(path.read_text()) == {"key": "value", "num": 42}
+
+    def test_atomic_write_json_overwrites_atomically(self, heart_mod, tmp_path):
+        path = tmp_path / "test.json"
+        heart_mod._atomic_write_json(path, {"v": 1})
+        heart_mod._atomic_write_json(path, {"v": 2})
+        import json
+        assert json.loads(path.read_text()) == {"v": 2}
+
+    def test_atomic_write_json_dry_run_skips(self, heart_mod, monkeypatch, tmp_path):
+        monkeypatch.setattr(heart_mod, "DRY_RUN", True)
+        path = tmp_path / "test.json"
+        heart_mod._atomic_write_json(path, {"v": 1})
+        assert not path.exists()
+
+    def test_atomic_write_yaml_creates_file(self, heart_mod, tmp_path):
+        path = tmp_path / "test.yaml"
+        heart_mod._atomic_write_yaml(path, {"key": "value", "list": [1, 2, 3]})
+        assert path.exists()
+        import yaml
+        assert yaml.safe_load(path.read_text()) == {"key": "value", "list": [1, 2, 3]}
+
+    def test_atomic_write_yaml_dry_run_skips(self, heart_mod, monkeypatch, tmp_path):
+        monkeypatch.setattr(heart_mod, "DRY_RUN", True)
+        path = tmp_path / "test.yaml"
+        heart_mod._atomic_write_yaml(path, {"v": 1})
+        assert not path.exists()
+
+    def test_atomic_write_text_creates_file(self, heart_mod, tmp_path):
+        path = tmp_path / "test.txt"
+        heart_mod._atomic_write_text(path, "hello world\n")
+        assert path.exists()
+        assert path.read_text() == "hello world\n"
+
+    def test_atomic_write_text_dry_run_skips(self, heart_mod, monkeypatch, tmp_path):
+        monkeypatch.setattr(heart_mod, "DRY_RUN", True)
+        path = tmp_path / "test.txt"
+        heart_mod._atomic_write_text(path, "hello")
+        assert not path.exists()
+
+
+# ── _amend_observation signal logic ───────────────────────────────────────────
+
+class TestAmendObservationSignals:
+    """Unit tests for _amend_observation signal generation logic.
+
+    Ensures that:
+    - new_ip signal fires on first observation
+    - geo_drift signal fires on country change
+    - is_vpn/is_tor/is_proxy signals fire on status change (0→1)
+    - geo_drift takes priority over vpn/tor/proxy when both change
+    - signal is per-cycle only (does not persist across cycles)
+    """
+
+    @pytest.fixture
+    def osint_mod(self):
+        """Fresh import of osint_cache per test."""
+        import importlib
+        import sys
+        for k in list(sys.modules.keys()):
+            if "osint_cache" in k:
+                del sys.modules[k]
+        import Heart.tools.osint_cache as m
+        importlib.reload(m)
+        return m
+
+    def test_new_ip_signal(self, osint_mod):
+        raw = {"ip": "192.0.2.1", "country_code": "BE", "is_vpn": False}
+        amended = osint_mod._amend_observation(None, raw)
+        assert amended["_signal"] == "new_ip"
+
+    def test_geo_drift_signal(self, osint_mod):
+        existing = {"country_code": "BE", "is_vpn": False, "is_tor": False, "is_proxy": False,
+                    "last_country_code": "BE", "geo_drift_count": 0, "last_drift_at": None}
+        raw = {"ip": "192.0.2.1", "country_code": "FR", "is_vpn": False}
+        amended = osint_mod._amend_observation(existing, raw)
+        assert amended["_signal"] == "geo_drift"
+        assert amended["geo_drift_count"] == 1
+        assert amended["last_country_code"] == "FR"
+
+    def test_vpn_signal_on_activation(self, osint_mod):
+        existing = {"country_code": "BE", "is_vpn": False, "is_tor": False, "is_proxy": False}
+        raw = {"ip": "192.0.2.1", "country_code": "BE", "is_vpn": True}
+        amended = osint_mod._amend_observation(existing, raw)
+        assert amended["_signal"] == "is_vpn"
+        assert amended["is_vpn"] is True
+
+    def test_tor_signal_on_activation(self, osint_mod):
+        existing = {"country_code": "BE", "is_vpn": False, "is_tor": False, "is_proxy": False}
+        raw = {"ip": "192.0.2.1", "country_code": "BE", "is_tor": True}
+        amended = osint_mod._amend_observation(existing, raw)
+        assert amended["_signal"] == "is_tor"
+        assert amended["is_tor"] is True
+
+    def test_proxy_signal_on_activation(self, osint_mod):
+        existing = {"country_code": "BE", "is_vpn": False, "is_tor": False, "is_proxy": False}
+        raw = {"ip": "192.0.2.1", "country_code": "BE", "is_proxy": True}
+        amended = osint_mod._amend_observation(existing, raw)
+        assert amended["_signal"] == "is_proxy"
+        assert amended["is_proxy"] is True
+
+    def test_geo_drift_priority_over_vpn(self, osint_mod):
+        """When both country drift AND VPN activation happen in same cycle,
+        geo_drift takes priority (set earlier in the function)."""
+        existing = {"country_code": "BE", "is_vpn": False, "is_tor": False, "is_proxy": False,
+                    "last_country_code": "BE", "geo_drift_count": 0}
+        raw = {"ip": "192.0.2.1", "country_code": "FR", "is_vpn": True}
+        amended = osint_mod._amend_observation(existing, raw)
+        assert amended["_signal"] == "geo_drift"
+        assert amended["is_vpn"] is True  # still recorded, just not the signal
+
+    def test_signal_does_not_persist_across_cycles(self, osint_mod):
+        """Signal is per-cycle only; a subsequent observation without changes
+        must NOT retain the previous cycle's signal."""
+        existing = {"country_code": "BE", "is_vpn": True, "is_tor": False, "is_proxy": False,
+                    "_signal": "is_vpn"}  # signal from previous cycle
+        raw = {"ip": "192.0.2.1", "country_code": "BE", "is_vpn": True}  # no change
+        amended = osint_mod._amend_observation(existing, raw)
+        # No status change → no _signal set (previous signal consumed)
+        assert "_signal" not in amended or amended.get("_signal") is None
+
+
+# ── prune_largest_first budget boundary ───────────────────────────────────────
+
+class TestPruneLargestFirstBudget:
+    """Boundary tests for prune_largest_first budget enforcement."""
+
+    @pytest.fixture
+    def shared_prune_mod(self):
+        """Fresh import of heart_shared_prune per test."""
+        import importlib
+        import sys
+        for k in list(sys.modules.keys()):
+            if "heart_shared_prune" in k:
+                del sys.modules[k]
+        import Heart.tools.heart_shared_prune as m
+        importlib.reload(m)
+        return m
+
+    def test_single_file_exceeds_budget_still_pruned(self, shared_prune_mod, tmp_path):
+        """A single file larger than budget must still be pruned (first file always
+        checked against budget AFTER adding its size)."""
+        d = tmp_path / "obs"
+        d.mkdir()
+        (d / "huge.bin").write_bytes(b"x" * 10_000)
+        n, b = shared_prune_mod.prune_largest_first([d], budget_bytes=1_000)
+        assert n == 1
+        assert b == 10_000
+        assert not (d / "huge.bin").exists()
+
+    def test_exact_budget_match_prunes_and_stops(self, shared_prune_mod, tmp_path):
+        """When bytes_pruned == budget_bytes exactly, loop must stop."""
+        d = tmp_path / "obs"
+        d.mkdir()
+        (d / "a.bin").write_bytes(b"x" * 5_000)
+        (d / "b.bin").write_bytes(b"x" * 5_000)
+        n, b = shared_prune_mod.prune_largest_first([d], budget_bytes=10_000)
+        assert n == 2
+        assert b == 10_000
+        assert not (d / "a.bin").exists()
+        assert not (d / "b.bin").exists()
+
+    def test_zero_budget_prunes_nothing(self, shared_prune_mod, tmp_path):
+        d = tmp_path / "obs"
+        d.mkdir()
+        (d / "a.bin").write_bytes(b"x" * 100)
+        n, b = shared_prune_mod.prune_largest_first([d], budget_bytes=0)
+        assert n == 0
+        assert b == 0
+        assert (d / "a.bin").exists()

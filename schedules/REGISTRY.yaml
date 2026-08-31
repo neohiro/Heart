@@ -1,4 +1,4 @@
----
+﻿---
 # Heart/schedules/REGISTRY.yaml — Per-scope registration for the
 # private-assistant tools, links, OSINT, and news populator scripts.
 # The Heart process reads this on every cycle and dispatches scripts
@@ -6,7 +6,9 @@
 #
 # STATUS: schema + scope registration. All four populate scripts are
 # implemented (Heart/scripts/{news,osint,links-validate,tools}-populate/run.py)
-# and unit-tested (Heart/scripts/tests/test_dispatchers.py — 23 tests pass).
+# and unit-tested in Heart/scripts/tests/test_dispatchers.py.
+# live-observer (Heart/tools/live_observer_runner.py) is registered as
+# a managed daemon (every_5_minutes; --once for tests).
 # The scripts read this REGISTRY.yaml, fetch the configured feeds, and
 # write to /shared/{news,osint,links,tools}/* with atomic writes + last-good
 # fallback. Run `python -m pytest Heart/scripts/tests/` to verify.
@@ -105,6 +107,217 @@ scopes:
       NEOHIRO_DEPENDABOT_OUT: "/shared/net/public"
       NEOHIRO_GITHUB_TOKEN: "${NEOHIRO_GITHUB_TOKEN}"
     flags: ["--quiet"]
+
+  - id: lint-watch
+    description: Auto-run ruff + mypy on edited .py files in critical modules (Heart, Brain, Mouth, userdata, iot, Mind, LLM); emit drift warning after 5 consecutive ticks with findings.
+    path: Heart/scripts/lint-watch/run.py
+    schedule: every_30_minutes
+    timeout_seconds: 300
+    retry_on_failure: false
+    max_retries: 0
+    env: {}
+    flags: ["--quiet"]
+    status: implemented   # 2026-08-30
+
+  - id: hz-scrape
+    description: Scrape /healthz from every online tailscale device; merge into /shared/hub/latest.json for the mesh hub.
+    path: Heart/scripts/hz-scrape/hz_scrape.py
+    schedule: every_5_minutes
+    timeout_seconds: 90
+    retry_on_failure: true
+    max_retries: 3
+    env:
+      NEOHIRO_SHARED_ROOT: "/shared"
+      NEOHIRO_HUB_TAILNET: "${TAILNET_NAME:-tail.ts.net}"
+      NEOHIRO_HUB_MAX_WORKERS: "8"
+      NEOHIRO_HUB_TIMEOUT: "5.0"
+      NEOHIRO_HUB_STALE_AFTER: "300"
+      NEOHIRO_HUB_RETENTION: "3600"
+    flags: ["--once", "--quiet"]
+    status: implemented   # 2026-08-30
+
+  - id: userdata-enrich
+    description: >
+      Cross-org user profile enrichment. Reads /shared/userdata/summaries/ (last 7d),
+      computes patterns/intent/sentiment/resolution rate, calls the LLM cascade for a
+      narrative summary (Heart Docker only), writes /shared/userdata/enrichments/<login>.yaml.
+      GitHub Actions fallback (db-enrichment-fallback.yml) runs deterministic-only when
+      Heart is unreachable. See DATABASE_ENRICHMENT.md § 2.
+    path: Heart/scripts/userdata-enrich/run.py
+    schedule: every_5_minutes
+    timeout_seconds: 120
+    retry_on_failure: true
+    max_retries: 1
+    fallback_github_actions: .github/workflows/db-enrichment-fallback.yml
+    env:
+      NEOHIRO_SHARED_ROOT: "/shared"
+      NEOHIRO_LLM_AVAILABLE: "1"
+    flags: ["--quiet", "--once"]
+    status: implemented   # 2026-08-30
+
+  - id: db-mirror
+    description: >
+      Cross-org database mirror for FOSS DB repos (news/osint/links/tools).
+      Refreshes cached snapshots for all four orgs (neohiro, frenzypenguin-media,
+      openstageisland, transhumanists) that feed dashboards and Brain intelligence.
+      Same two-tier architecture as userdata-enrich. See DATABASE_ENRICHMENT.md § 2.
+    path: Heart/scripts/db-mirror/run.py
+    schedule: every_15_minutes
+    timeout_seconds: 90
+    retry_on_failure: true
+    max_retries: 1
+    fallback_github_actions: .github/workflows/db-enrichment-fallback.yml
+    env:
+      NEOHIRO_SHARED_ROOT: "/shared"
+      NEOHIRO_LLM_AVAILABLE: "1"
+    flags: ["--quiet", "--once"]
+    status: scaffold       # 2026-08-30
+
+
+  - id: grounding-audit
+    description: "GROUNDING.md §2: sample N (entity, datapoint) pairs from sources.yaml, re-fetch from source, compare vs cached, write grounding.jsonl + /shared/public/health/grounding.json. Emits poke if rate < 0.90 for two consecutive cycles."
+    path: Heart/tools/grounding.py
+    schedule: every_30_minutes
+    timeout_seconds: 120
+    retry_on_failure: true
+    max_retries: 1
+    env:
+      NEOHIRO_SHARED_ROOT: "/shared"
+      GH_TOKEN: "${GH_TOKEN:-}"
+    flags: ["--quiet"]
+    status: implemented   # 2026-08-31
+
+  - id: userdata-memory-bridge
+    description: "Userdata memory bridge: read age-encrypted profiles, episodes, interests, hearsay from neohiro/userdata; write Brain entity projections. Bridges private-assistant canonical memory to Brain awareness."
+    path: Heart/tools/memory_bridge_heart.py
+    schedule: every_5_minutes
+    timeout_seconds: 30
+    retry_on_failure: true
+    max_retries: 2
+    env:
+      USERDATA_DIR: "/var/lib/userdata"
+      USERDATA_IDENTITY_DIR: "/var/lib/userdata/identities"
+      BRAIN_ENTITY_DIR: "/shared/brain/_entities"
+      GODADMIN_IDENTITY: "${GODADMIN_IDENTITY:-}"
+    flags: ["--quiet", "--heart-mode"]
+    status: implemented   # 2026-08-31
+
+  - id: live-observer
+    description: "BRAIN_LIVE_OBSERVER.md: managed daemon that watches all org repos (discovered from Brain/_entities/org-*.md) and emits per-file change records to /shared/brain/watch/changes/. Daemon mode is restart-only; SIGTERM drains timers and removes the sentinel."
+    path: Heart/tools/live_observer_runner.py
+    schedule: every_5_minutes
+    timeout_seconds: 60
+    retry_on_failure: true
+    max_retries: 1
+    env:
+      BRAIN_PATH: "/brain"
+      NEOHIRO_REPO_ROOT: "/repos"
+      NEOHIRO_WATCH_DIR: "/shared/brain/watch"
+    flags: ["--once"]
+    status: implemented   # 2026-08-31
+
+  - id: brain-device-retro
+    description: "Brain/BRAIN_DEVICE_AGENCY.md §6: post-interaction retro loop. Reads /shared/brain/feedback/*.yaml (emitted by Brain/src/brain_device_agency.py:emit_feedback after every cross-repo agency action). For each feedback: runs retrospective + introspective check; calls neohiro-doctor if action is service_install or health_regression; pokes godadmin if dev performed a cross-privilege action; appends /shared/brain/audit/self_improvement.yaml; writes /shared/brain/heartbeat/retro/<id>.yaml; marks feedback processed. Opt-in: no-op when NEOHIRO_BRAIN_DEVICE_TOOLSET_ENABLED=0 or manifest missing."
+    path: Heart/tools/brain_device_agency_heart.py
+    schedule: every_5_minutes
+    timeout_seconds: 60
+    retry_on_failure: true
+    max_retries: 1
+    env:
+      BRAIN_PATH: "/brain"
+      NEOHIRO_BRAIN_DEVICE_FEEDBACK_DIR: "/shared/brain/feedback"
+      NEOHIRO_BRAIN_DEVICE_RETRO_DIR: "/shared/brain/heartbeat/retro"
+      NEOHIRO_BRAIN_DEVICE_TOOLSET_PATH: "/brain/config/brain_device_toolset.yaml"
+    flags: ["--once"]
+    status: implemented   # 2026-08-31
+
+# ── Channel-publishing scopes ────────────────────────────────────────────────
+# These scopes control how Mouth formats output for public-facing channels.
+# Each scope validates against /Brain/src/scope_channels.py before any post.
+# The "channel" key identifies the channel policy to consult; the
+# "audit_hook" script validates that no PII leaks to the channel.
+  - id: publish-facebook
+    description: "Validate and publish Facebook page posts (transhumanistsBE, FPM brands) via Mouth + Brain gate. Channel: facebook_page."
+    path: Heart/scripts/publish/run.py
+    channel: facebook_page
+    schedule: every_30_minutes
+    timeout_seconds: 60
+    retry_on_failure: true
+    max_retries: 2
+    env:
+      NEOHIRO_MOUTH_CHANNEL: "facebook_page"
+      NEOHIRO_BRAIN_GATE: "1"
+    flags: ["--channel=facebook_page"]
+    status: implemented   # 2026-08-30
+
+  - id: publish-instagram
+    description: "Validate and publish Instagram brand posts via Mouth + Brain gate. Channel: instagram_brand."
+    path: Heart/scripts/publish/run.py
+    channel: instagram_brand
+    schedule: every_30_minutes
+    timeout_seconds: 60
+    retry_on_failure: true
+    max_retries: 2
+    env:
+      NEOHIRO_MOUTH_CHANNEL: "instagram_brand"
+      NEOHIRO_BRAIN_GATE: "1"
+    flags: ["--channel=instagram_brand"]
+    status: implemented   # 2026-08-30
+
+  - id: publish-webpage
+    description: "Validate and publish Jekyll _posts / _pages to github.io sites. Channel: public_webpage."
+    path: Heart/scripts/publish/run.py
+    channel: public_webpage
+    schedule: every_60_minutes
+    timeout_seconds: 120
+    retry_on_failure: true
+    max_retries: 2
+    env:
+      NEOHIRO_MOUTH_CHANNEL: "public_webpage"
+      NEOHIRO_BRAIN_GATE: "1"
+    flags: ["--channel=public_webpage"]
+    status: implemented   # 2026-08-30
+
+  - id: publish-readme
+    description: "Validate and update README.md files in public repos. Channel: public_readme."
+    path: Heart/scripts/publish/run.py
+    channel: public_readme
+    schedule: every_60_minutes
+    timeout_seconds: 60
+    retry_on_failure: true
+    max_retries: 1
+    env:
+      NEOHIRO_MOUTH_CHANNEL: "public_readme"
+      NEOHIRO_BRAIN_GATE: "1"
+    flags: ["--channel=public_readme"]
+    status: implemented   # 2026-08-30
+
+  - id: publish-github-issue
+    description: "Validate and open public GitHub issues. Channel: github_issue."
+    path: Heart/scripts/publish/run.py
+    channel: github_issue
+    schedule: every_15_minutes
+    timeout_seconds: 60
+    retry_on_failure: true
+    max_retries: 2
+    env:
+      NEOHIRO_MOUTH_CHANNEL: "github_issue"
+      NEOHIRO_BRAIN_GATE: "1"
+    flags: ["--channel=github_issue"]
+    status: implemented   # 2026-08-30
+
+  - id: channel-audit
+    description: "Run /Brain/src/scope_channels.py:audit_channel_matrix() and write the full role × channel gate matrix to /shared/heart/audit/channel_matrix.json. Doctor reads this on every cycle."
+    path: Heart/scripts/channel-audit/run.py
+    schedule: every_6_hours
+    timeout_seconds: 60
+    retry_on_failure: true
+    max_retries: 1
+    env:
+      NEOHIRO_BRAIN_SRC: "Brain/src"
+      NEOHIRO_AUDIT_OUT: "/shared/heart/audit/channel_matrix.json"
+    flags: ["--once", "--quiet"]
+    status: implemented   # 2026-08-30
 
 # Per-scope failure demotion
 failure_policy:

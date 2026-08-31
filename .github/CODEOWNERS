@@ -1,0 +1,26 @@
+# CODEOWNERS — neohiro/Heart
+#
+# Per-scope Heart cadence + per-repo override.
+# All changes reviewed by @neohiro.
+
+# Default owners
+* @neohiro
+
+# Cadence engine — operator-critical
+tools/heart.py @neohiro
+tools/heartctl.py @neohiro
+heart/ @neohiro
+
+# Schedules and dispatchers
+schedules/ @neohiro
+scripts/ @neohiro
+
+# CI / workflows
+.github/workflows/ @neohiro
+compose.yml @neohiro
+Dockerfile @neohiro
+
+# Security / governance
+SECURITY.md @neohiro
+CODE_OF_CONDUCT.md @neohiro
+CREDITS.md @neohiro

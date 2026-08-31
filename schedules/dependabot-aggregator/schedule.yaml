@@ -1,0 +1,9 @@
+schedule: every_6_hours
+timeout_seconds: 300
+retry_on_failure: true
+max_retries: 2
+retry_backoff_seconds: 30
+run_on_startup: false
+fallback:
+  github_actions: .github/workflows/dependabot-aggregator.yml
+  cron: "0 */6 * * *"

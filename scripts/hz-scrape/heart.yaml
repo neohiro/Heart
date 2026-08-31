@@ -1,0 +1,35 @@
+# Heart scope: hz-scrape
+# Discovers all tailscale devices and scrapes their /healthz endpoint.
+# See SPEC_HUB.md § 3 for the full spec.
+
+scope: hz-scrape
+description: |
+  Scrapes the mesh healthz daemon (:9600/healthz) from every online
+  tailscale device on the tailnet. Persists per-device snapshots,
+  merges into hub/latest.json, and writes a public rollup for the SVG renderer.
+runs_on: heart
+cadence:
+  interval: every_60s
+  timeout: 90s
+  retries: 3
+  backoff: exponential
+  retry_schedule: [5, 15, 30]
+env:
+  NEOHIRO_SHARED_ROOT: /shared
+  NEOHIRO_HUB_TAILNET: ${TAILNET_NAME}
+  NEOHIRO_HUB_MAX_WORKERS: "8"
+  NEOHIRO_HUB_TIMEOUT: "5.0"
+  NEOHIRO_HUB_STALE_AFTER: "300"
+flags:
+  - --once
+  - --tailnet
+  - --shared-root
+  - --device
+  - --dry-run
+  - --verbose
+entrypoint: python Heart/scripts/hz-scrape/hz_scrape.py
+heart_phase: 15_audit  # Runs in the audit phase after all other dispatchers
+priority: high
+self_heal:
+  on_failure: retry
+  max_retries: 5

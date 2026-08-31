@@ -1,0 +1,42 @@
+# Heart/scripts/userdata-enrich/heart.yaml
+#
+# Per-scope steering manifest for the userdata-enrich dispatcher.
+# Discovered by the Heart process per HEART_SCHEDULE_REGISTRY.md § 8.
+
+scope: userdata-enrich
+description: >
+  Cross-org user profile enrichment. Reads /shared/userdata/summaries/ (last 7d),
+  computes deterministic metrics (patterns, intent, sentiment, resolution rate),
+  and (in Heart Docker only) calls the LLM cascade for a brief narrative summary.
+  Writes to /shared/userdata/enrichments/<login>.yaml with chmod 600.
+
+# When the Heart Docker runs this, it sets NEOHIRO_LLM_AVAILABLE=1.
+# When GitHub Actions runs this, the env var is unset → no LLM call.
+env:
+  NEOHIRO_LLM_AVAILABLE: "${NEOHIRO_LLM_AVAILABLE:-0}"
+  NEOHIRO_SHARED_ROOT: "/shared"
+
+flags:
+  - --quiet
+  - --once
+
+privacy:
+  deny_fields: [ip, email, phone, raw_name, address, password, token]
+  chmod_on_write: "0600"
+  append_only_summaries: true
+
+# Per the two-tier architecture in DATABASE_ENRICHMENT.md:
+# - Heart (Docker) runs this every_5_minutes with LLM enabled.
+# - GitHub Actions fallback runs this every 30 min with LLM disabled.
+# The fast-exit gate (Heart liveness check) prevents double-running.
+fallback:
+  github_actions: .github/workflows/db-enrichment-fallback.yml
+  cron: "*/30 * * * *"
+  max_duration_seconds: 240
+  llm_enabled: false
+
+notes: |
+  Fast-exit gate lives in the GitHub Actions fallback workflow
+  (db-enrichment-fallback.yml). Heart-side runs always assume Heart is alive
+  (since it is itself the Heart process); the gate is only relevant for the
+  fallback path.

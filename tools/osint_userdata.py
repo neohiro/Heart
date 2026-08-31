@@ -40,7 +40,6 @@ import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
 
 _WORKSPACE = Path(__file__).resolve().parent.parent.parent
 for _p in (str(_WORKSPACE), str(_WORKSPACE / "userdata" / "src"), str(_WORKSPACE / "Brain" / "src")):
@@ -409,9 +408,6 @@ def run_phase(brain_path: str | Path) -> dict:
         _log("warn", f"organ failure detected: {health['organ_failures']} — engaging bidirectional backup path")
         write_result = write_triage_flags(resurrections)
 
-    # Append to heartbeat digest for the dashboard
-    digest_path = bp / "heartbeat" / "userdata_osint_digest.json"
-    digest_path.parent.mkdir(parents=True, exist_ok=True)
     digest = {
         "ts": _now(),
         "heart_health": {
@@ -434,7 +430,11 @@ def run_phase(brain_path: str | Path) -> dict:
         "duration_ms": int((datetime.now(timezone.utc) - start).total_seconds() * 1000),
         "ok": True,
     }
-    digest_path.write_text(json.dumps(digest, indent=2))
+    # Append to heartbeat digest for the dashboard
+    digest_path = bp / "heartbeat" / "userdata_osint_digest.json"
+    digest_path.parent.mkdir(parents=True, exist_ok=True)
+    from atomic import write_json
+    write_json(digest_path, digest, prefix=".digest.")
     return digest
 
 

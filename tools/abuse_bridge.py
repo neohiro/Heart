@@ -46,12 +46,22 @@ try:
         admin_briefing as ghost_admin_briefing,
     )
     from Brain.src.abuse_filter import AbuseSignal, evaluate, apply_verdicts
-
     ABUSE_FILTER_AVAILABLE = True
 except ImportError as _e:
     print(f"[abuse_bridge] import failed: {_e}", file=sys.stderr)
     _tb.print_exc(file=sys.stderr)
+    create_from_ip_observation = None   # type: ignore[assignment]
+    create_from_third_party = None      # type: ignore[assignment]
+    ip_ghost_id = None                  # type: ignore[assignment]
+    ghost_record_from_brain = None      # type: ignore[assignment]
+    ghost_check_resurrection = None     # type: ignore[assignment]
+    ghost_admin_briefing = None         # type: ignore[assignment]
     ABUSE_FILTER_AVAILABLE = False
+
+from atomic import (
+    write_json as _atomic_write_json,
+    write_text as _atomic_write_text,
+)
 
 BRAIN_PATH = Path(os.environ.get("BRAIN_PATH", "/brain"))
 ABUSE_INBOX_DIR = BRAIN_PATH / "heartbeat" / "abuse_signals"
@@ -132,10 +142,13 @@ def run_phase(brain_path: Optional[Path] = None) -> dict:
 
     for p in sorted(signals_inbox.glob("*.json")):
         try:
-            raw = json.loads(p.read_text())
-        except Exception:
-            _log(f"corrupted signal file: {p.name}", "warn")
-            p.unlink()
+            raw = json.loads(p.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError) as e:
+            _log(f"corrupted signal file {p.name}: {e}", "warn")
+            try:
+                p.unlink()
+            except OSError as ue:
+                _log(f"inbox cleanup failed for {p.name}: {ue}", "warn")
             continue
 
         signals_processed += 1
@@ -185,7 +198,9 @@ def run_phase(brain_path: Optional[Path] = None) -> dict:
                 if v.severity in ("ESCALATE", "FLAG"):
                     verdict_file = bp / "audit" / "abuse" / f"{_safe_filename(v.entity_id)}_{_safe_filename(v.rule_id)}.json"
                     verdict_file.parent.mkdir(parents=True, exist_ok=True)
-                    verdict_file.write_text(json.dumps(v.__dict__, indent=2))
+                    _atomic_write_json(
+                        verdict_file, v.__dict__, prefix=".verdict.",
+                    )
 
             # Ghost creation for ip_observed signals
             if source == "heartbeat_osint" and signal_type == "ip_observed":
@@ -247,20 +262,24 @@ def run_phase(brain_path: Optional[Path] = None) -> dict:
                     except Exception as e:
                         _log(f"ghost resurrection check failed: {e}", "warn")
 
-        # Move processed signal to archive
+        # Move processed signal to archive. Always copy then unlink rather
+        # than rename — rename overwrites on Windows NTFS, silently losing a
+        # concurrent signal with the same stem+timestamp. Using copy+unlink
+        # also lets us atomically stage the archive via _atomic_write_text.
+        # If the archive write fails we keep the signal in the inbox for retry.
+        archive_dir = signals_inbox / "processed"
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        archive_name = f"{p.stem}_{_now_filename()}.json"
+        target = archive_dir / archive_name
         try:
-            archive_dir = signals_inbox / "processed"
-            archive_dir.mkdir(parents=True, exist_ok=True)
-            archive_name = f"{p.stem}_{_now_filename()}.json"
-            p.rename(archive_dir / archive_name)
-        except FileExistsError:
-            # Stale archive with the same name — overwrite via copy+unlink
-            target = archive_dir / archive_name
-            target.write_text(p.read_text())
+            _atomic_write_text(target, p.read_text(encoding="utf-8"), prefix=".archive.")
+        except OSError as e:
+            _log(f"archive write failed for {p.name}: {e}", "warn")
+            continue  # keep p in inbox for retry
+        try:
             p.unlink()
         except OSError as e:
-            _log(f"archive failed for {p.name}: {e}", "warn")
-            p.unlink()
+            _log(f"inbox cleanup failed for {p.name}: {e}", "warn")
 
     digest["cycle_verdicts"] = verdicts_total
     digest["signals_processed"] = signals_processed
@@ -269,7 +288,7 @@ def run_phase(brain_path: Optional[Path] = None) -> dict:
     # Write digest for RT healthcare hub
     digest_path = bp / "heartbeat" / "abuse_digest.json"
     digest_path.parent.mkdir(parents=True, exist_ok=True)
-    digest_path.write_text(json.dumps(digest, indent=2))
+    _atomic_write_json(digest_path, digest, prefix=".digest.")
 
     # Emit admin briefing into Brain so RT hub and dashboard can read it
     if ABUSE_FILTER_AVAILABLE:
@@ -279,7 +298,7 @@ def run_phase(brain_path: Optional[Path] = None) -> dict:
             brief["resurrections_this_cycle"] = resurrections
             brief_path = bp / "heartbeat" / "admin_briefing.json"
             brief_path.parent.mkdir(parents=True, exist_ok=True)
-            brief_path.write_text(json.dumps(brief, indent=2))
+            _atomic_write_json(brief_path, brief, prefix=".brief.")
         except Exception as e:
             _log(f"admin_briefing write failed: {e}", "warn")
 
@@ -337,7 +356,7 @@ def enqueue_signal(
     }
 
     fname = f"{_safe_filename(source)}_{_safe_filename(signal_type)}_{_safe_filename(entity_id)}_{_now_filename()}.json"
-    (inbox / fname).write_text(json.dumps(signal))
+    _atomic_write_json(inbox / fname, signal, prefix=".signal.")
 
 
 if __name__ == "__main__":

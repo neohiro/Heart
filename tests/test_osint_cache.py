@@ -32,6 +32,16 @@ def osint_mod():
 
 
 @pytest.fixture
+def shared_prune_mod():
+    """Fresh import of heart_shared_prune per test to avoid state leakage."""
+    for k in list(sys.modules.keys()):
+        if "heart_shared_prune" in k:
+            del sys.modules[k]
+    from Heart.tools import heart_shared_prune
+    return heart_shared_prune
+
+
+@pytest.fixture
 def bp(tmp_path) -> Path:
     """Fresh Brain path for each test. Also remove any stale lock from a prior
     crashed run so the lock acquisition does not timeout waiting for a dead owner."""
@@ -343,7 +353,8 @@ class TestLoadIncoming:
     def test_empty_inbox(self, osint_mod, bp):
         assert osint_mod._load_incoming(bp) == []
 
-    def test_reads_and_clears_inbox(self, osint_mod, bp):
+    def test_reads_and_returns_paths(self, osint_mod, bp):
+        """Files are NOT deleted by _load_incoming; they are deleted in run_phase after successful save."""
         inbox = bp / "heartbeat" / osint_mod.SIGNALS_INCOMING_DIR
         inbox.mkdir(parents=True, exist_ok=True)
         (inbox / "obs1.json").write_text(json.dumps({
@@ -353,10 +364,16 @@ class TestLoadIncoming:
             "ip": "192.0.2.2", "country": "FR", "country_code": "FR"
         }))
 
-        raw = osint_mod._load_incoming(bp)
-        assert len(raw) == 2
-        # Inbox should be cleared (raw files consumed)
-        assert list(inbox.glob("*.json")) == []
+        raw_with_paths = osint_mod._load_incoming(bp)
+        assert len(raw_with_paths) == 2
+        # Files remain in inbox until run_phase saves cache successfully
+        assert len(list(inbox.glob("*.json"))) == 2
+        # Verify return structure: list of (raw_dict, Path) tuples
+        assert all(isinstance(item, tuple) and len(item) == 2 for item in raw_with_paths)
+        assert all(isinstance(item[0], dict) and isinstance(item[1], Path) for item in raw_with_paths)
+        # Verify IP content
+        ips = {item[0].get("ip") for item in raw_with_paths}
+        assert ips == {"192.0.2.1", "192.0.2.2"}
 
     def test_skips_files_without_ip(self, osint_mod, bp):
         inbox = bp / "heartbeat" / osint_mod.SIGNALS_INCOMING_DIR
@@ -371,6 +388,56 @@ class TestLoadIncoming:
         (inbox / "bad.json").write_text("{ not json")
         assert osint_mod._load_incoming(bp) == []
         assert list(inbox.glob("*.json")) == []  # deleted
+
+
+# ── Stale lock detection ──────────────────────────────────────────────────────
+
+class TestStaleLock:
+    """Tests for stale lock detection in _acquire_lock.
+
+    A lock directory older than 2x timeout_s (default 60s) is considered
+    abandoned and is automatically removed so the next process can proceed.
+    """
+
+    def test_stale_lock_is_removed_and_acquired(self, osint_mod, bp, monkeypatch):
+        """A lock directory older than 60s is stale and gets auto-removed."""
+        import os, time
+        lock_path = bp / "heartbeat" / ".osint_run_phase.lock"
+        lock_path.mkdir(parents=True, exist_ok=True)
+        # Set mtime to 70 seconds ago (stale threshold is 2*30s = 60s)
+        old_time = time.time() - 70
+        os.utime(lock_path, (old_time, old_time))
+
+        # Should acquire immediately (stale lock removed, new one created)
+        acquired = osint_mod._acquire_lock(lock_path, timeout_s=30)
+        from atomic import FileLock
+        assert isinstance(acquired, FileLock), f"expected FileLock, got {type(acquired).__name__}"
+        assert acquired.path == lock_path
+        assert lock_path.exists()  # new lock exists
+
+    def test_fresh_lock_blocks_acquisition(self, osint_mod, bp, monkeypatch):
+        """A fresh lock blocks acquisition until timeout."""
+        import pytest
+        import sys
+        lock_path = bp / "heartbeat" / ".osint_run_phase.lock"
+        lock_path.mkdir(parents=True, exist_ok=True)
+
+        # msvcrt.locking does not share locks across separate file handles on Windows —
+        # this test cannot reliably test blocking behavior on win32.
+        if sys.platform == "win32":
+            pytest.skip("msvcrt locking is not shared across lock-file instances on Windows")
+
+        # Should timeout quickly with 1s timeout
+        with pytest.raises(TimeoutError):
+            osint_mod._acquire_lock(lock_path, timeout_s=1)
+
+    def test_lock_path_returned_on_success(self, osint_mod, bp):
+        """_acquire_lock returns a FileLock object with .path equal to the input path."""
+        lock_path = bp / "heartbeat" / ".osint_run_phase.lock"
+        acquired = osint_mod._acquire_lock(lock_path, timeout_s=30)
+        from atomic import FileLock
+        assert isinstance(acquired, FileLock), f"expected FileLock, got {type(acquired).__name__}"
+        assert acquired.path == lock_path, f"FileLock.path should be {lock_path}, got {acquired.path}"
 
 
 # ── Top-level run_phase (READ → AMEND → WRITE + enqueue) ──────────────────
@@ -917,3 +984,364 @@ class TestRunPhaseUserdata:
         assert gp is not None
         assert gp.country_code == "BE"
 
+
+# ── prune_largest_first helper (unit tests) ──────────────────────────────────
+
+class TestPruneLargestFirst:
+    """Tests for the standalone prune_largest_first helper.
+
+    This is a pure function: caller supplies the directory list and budget.
+    Heart._phase_prune_shared uses it; Mouth and iot can reuse it without
+    re-implementing the largest-first sort and budget bookkeeping.
+    """
+
+    def test_returns_zero_zero_on_empty_dir(self, shared_prune_mod, tmp_path):
+        d = tmp_path / "obs"
+        d.mkdir()
+        n, b = shared_prune_mod.prune_largest_first([d], budget_bytes=1_000_000)
+        assert (n, b) == (0, 0)
+
+    def test_returns_zero_zero_on_nonexistent_dir(self, shared_prune_mod, tmp_path):
+        d = tmp_path / "does_not_exist"
+        n, b = shared_prune_mod.prune_largest_first([d], budget_bytes=1_000_000)
+        assert (n, b) == (0, 0)
+
+    def test_largest_first(self, shared_prune_mod, tmp_path):
+        d = tmp_path / "obs"
+        d.mkdir()
+        small = d / "small.bin"
+        large = d / "large.bin"
+        tiny = d / "tiny.bin"
+        small.write_bytes(b"x" * 1_000)
+        large.write_bytes(b"x" * 100_000)
+        tiny.write_bytes(b"x" * 10)
+        n, b = shared_prune_mod.prune_largest_first([d], budget_bytes=1_000_000)
+        assert n == 3
+        assert b == 101_010
+        assert not small.exists()
+        assert not large.exists()
+        assert not tiny.exists()
+
+    def test_stops_at_budget(self, shared_prune_mod, tmp_path):
+        d = tmp_path / "obs"
+        d.mkdir()
+        (d / "a.bin").write_bytes(b"x" * 5_000)
+        (d / "b.bin").write_bytes(b"x" * 5_000)
+        (d / "c.bin").write_bytes(b"x" * 5_000)
+        n, b = shared_prune_mod.prune_largest_first([d], budget_bytes=7_000)
+        assert n == 2
+        assert b == 10_000
+        leftover = list(d.iterdir())
+        assert len(leftover) == 1
+
+    def test_walks_subdirectories(self, shared_prune_mod, tmp_path):
+        d = tmp_path / "obs"
+        sub = d / "sub"
+        d.mkdir()
+        sub.mkdir(parents=True)
+        (d / "top.bin").write_bytes(b"x" * 100)
+        (sub / "deep.bin").write_bytes(b"x" * 200)
+        n, b = shared_prune_mod.prune_largest_first([d], budget_bytes=1_000_000)
+        assert n == 2
+        assert b == 300
+
+    def test_aggregates_multiple_directories(self, shared_prune_mod, tmp_path):
+        d1 = tmp_path / "d1"
+        d2 = tmp_path / "d2"
+        d1.mkdir()
+        d2.mkdir()
+        (d1 / "a.bin").write_bytes(b"x" * 100)
+        (d2 / "b.bin").write_bytes(b"x" * 200)
+        n, b = shared_prune_mod.prune_largest_first([d1, d2], budget_bytes=1_000_000)
+        assert n == 2
+        assert b == 300
+
+    def test_accepts_string_paths(self, shared_prune_mod, tmp_path):
+        d = tmp_path / "obs"
+        d.mkdir()
+        (d / "a.bin").write_bytes(b"x" * 100)
+        n, b = shared_prune_mod.prune_largest_first([str(d)], budget_bytes=1_000_000)
+        assert n == 1
+
+
+class TestIsDryRun:
+    """Unit tests for _is_dry_run (dry-run gate)."""
+
+    def test_false_when_no_env_and_no_sentinel(self, shared_prune_mod, monkeypatch, tmp_path):
+        monkeypatch.delenv("HEART_DRY_RUN", raising=False)
+        sentinel = tmp_path / "heartbeat" / ".dry_run"
+        sentinel.parent.mkdir(parents=True)
+        assert not shared_prune_mod._is_dry_run(tmp_path)
+
+    def test_true_when_env_is_1(self, shared_prune_mod, monkeypatch, tmp_path):
+        monkeypatch.setenv("HEART_DRY_RUN", "1")
+        assert shared_prune_mod._is_dry_run(tmp_path)
+
+    def test_true_when_env_is_any_nonempty_string(self, shared_prune_mod, monkeypatch, tmp_path):
+        for val in ("yes", "true", "on", "1", "any-garbage"):
+            monkeypatch.setenv("HEART_DRY_RUN", val)
+            assert shared_prune_mod._is_dry_run(tmp_path), f"HEART_DRY_RUN={val!r} should be True"
+
+    def test_false_when_env_is_0(self, shared_prune_mod, monkeypatch, tmp_path):
+        monkeypatch.setenv("HEART_DRY_RUN", "0")
+        assert not shared_prune_mod._is_dry_run(tmp_path)
+
+    def test_true_when_sentinel_file_exists(self, shared_prune_mod, monkeypatch, tmp_path):
+        monkeypatch.delenv("HEART_DRY_RUN", raising=False)
+        sentinel = tmp_path / "heartbeat" / ".dry_run"
+        sentinel.parent.mkdir(parents=True)
+        sentinel.touch()
+        assert shared_prune_mod._is_dry_run(tmp_path)
+
+    def test_sentinel_overrides_env_zero(self, shared_prune_mod, monkeypatch, tmp_path):
+        monkeypatch.setenv("HEART_DRY_RUN", "0")
+        sentinel = tmp_path / "heartbeat" / ".dry_run"
+        sentinel.parent.mkdir(parents=True)
+        sentinel.touch()
+        assert shared_prune_mod._is_dry_run(tmp_path), "sentinel must override HEART_DRY_RUN=0"
+
+    def test_true_when_heart_module_dry_run_flag_is_set(self, shared_prune_mod, monkeypatch, tmp_path):
+        """When heartctl.cmd_phase sets heart.DRY_RUN=True and restores it to
+        False after, the HEART_DRY_RUN env var may still be '1' but should NOT
+        count as dry-run once the flag is cleared. Conversely, the module flag
+        itself must be authoritative: if it's True we are in dry-run regardless
+        of env."""
+        monkeypatch.delenv("HEART_DRY_RUN", raising=False)
+        import Heart.tools.heart as _heart_module
+        previous = _heart_module.DRY_RUN
+        try:
+            _heart_module.DRY_RUN = True
+            assert shared_prune_mod._is_dry_run(tmp_path)
+        finally:
+            _heart_module.DRY_RUN = previous
+
+    def test_false_for_nonexistent_brain_path(self, shared_prune_mod, monkeypatch, tmp_path):
+        monkeypatch.delenv("HEART_DRY_RUN", raising=False)
+        absent = tmp_path / "does_not_exist"
+        assert not shared_prune_mod._is_dry_run(absent)
+
+
+class TestCollectFiles:
+    """Unit tests for _collect_files (recursive file collection)."""
+
+    def test_empty_dir_returns_empty_list(self, shared_prune_mod, tmp_path):
+        d = tmp_path / "empty"
+        d.mkdir()
+        assert shared_prune_mod._collect_files(d) == []
+
+    def test_nonexistent_dir_returns_empty_list(self, shared_prune_mod, tmp_path):
+        d = tmp_path / "no_such_dir"
+        assert shared_prune_mod._collect_files(d) == []
+
+    def test_single_file(self, shared_prune_mod, tmp_path):
+        d = tmp_path / "dir"
+        d.mkdir()
+        f = d / "file.txt"
+        f.write_bytes(b"hello world")
+        result = shared_prune_mod._collect_files(d)
+        assert len(result) == 1
+        size, path = result[0]
+        assert size == 11
+        assert path == f
+
+    def test_nested_subdirs_collected(self, shared_prune_mod, tmp_path):
+        d = tmp_path / "root"
+        d.mkdir()
+        (d / "top.txt").write_bytes(b"top")
+        sub1 = d / "sub1"
+        sub1.mkdir()
+        (sub1 / "mid.txt").write_bytes(b"mid")
+        sub2 = sub1 / "sub2"
+        sub2.mkdir()
+        (sub2 / "deep.txt").write_bytes(b"deep")
+        result = shared_prune_mod._collect_files(d)
+        sizes = {p.name for _, p in result}
+        assert sizes == {"top.txt", "mid.txt", "deep.txt"}
+
+    def test_symlink_dir_with_external_target_is_excluded(self, shared_prune_mod, tmp_path):
+        """A symlink-to-directory whose target is OUTSIDE the safe root must not be recursed.
+
+        The realpath containment check (is_relative_to on resolved paths) drops
+        the symlink entry before any recursion. This is the realistic attack
+        vector the check is designed to prevent: a writable signals_incoming dir
+        containing a symlink pointing elsewhere must not be followed.
+        """
+        d = tmp_path / "root"
+        d.mkdir()
+        external = tmp_path / "external"
+        external.mkdir()
+        (external / "outside.txt").write_bytes(b"secret")
+        (d / "inside.txt").write_bytes(b"safe")
+        try:
+            (d / "link_to_external").symlink_to(external)
+        except (OSError, NotImplementedError):
+            pytest.skip("symlinks not available")
+        result = shared_prune_mod._collect_files(d)
+        names = {p.name for _, p in result}
+        assert "inside.txt" in names, "real file inside root must be collected"
+        assert "outside.txt" not in names, (
+            "symlink-to-dir whose target is outside root must not be recursed; "
+            f"collected: {names}"
+        )
+
+    def test_symlink_outside_safe_root_not_followed(self, shared_prune_mod, tmp_path):
+        """A symlink-to-file pointing outside the safe root must NOT be collected.
+        _is_path_under checks the resolved path against the declared root, so
+        a symlink that crosses the boundary is excluded before any stat()/unlink()."""
+        d = tmp_path / "safe"
+        d.mkdir()
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (outside / "protected.txt").write_bytes(b"must not collect")
+        try:
+            (d / "escape_link.txt").symlink_to(outside / "protected.txt")
+        except (OSError, NotImplementedError):
+            pytest.skip("symlinks not available")
+        result = shared_prune_mod._collect_files(d)
+        names = {p.name for _, p in result}
+        assert "escape_link.txt" not in names, "symlink-to-file outside root must be excluded"
+        assert "protected.txt" not in [p.name for _, p in result]
+
+    def test_broken_symlink_to_file_ignored(self, shared_prune_mod, tmp_path):
+        d = tmp_path / "dir"
+        d.mkdir()
+        try:
+            (d / "broken.lnk").symlink_to(tmp_path / "does_not_exist")
+        except (OSError, NotImplementedError):
+            pytest.skip("symlinks not available")
+        result = shared_prune_mod._collect_files(d)
+        assert result == [], "broken symlink-to-nonexistent is ignored"
+
+
+# ── Cross-process lock (subprocess on Windows spawn) ──────────────────────
+
+class TestRunPhaseCrossProcess:
+    def test_run_phase_blocks_concurrent_runner_until_lock_released(self, osint_mod, bp):
+        """Pass-2/2 proposal 2: Two concurrent run_phase processes must not
+        race. The lock ensures the second process waits for the first to
+        complete before draining its cycle — preventing duplicate writes to
+        userdata and ensuring each process observes a consistent cache state.
+
+        Uses subprocess (not multiprocessing) so the worker is a top-level
+        script string — picklable on Windows spawn. Proves:
+        1. Both processes succeed (neither hits the 30s lock timeout)
+        2. Exactly 1 new_ip total across both runs (no double-count)
+        """
+        import json
+        import subprocess
+        import threading
+        import time as _t
+        errors: list[str] = []
+
+        inbox = bp / "heartbeat" / osint_mod.SIGNALS_INCOMING_DIR
+        inbox.mkdir(parents=True, exist_ok=True)
+        (inbox / "obs1.json").write_text(json.dumps({
+            "ip": "192.0.2.200", "country_code": "BE"
+        }))
+
+        bp_str = str(bp.resolve())
+        userdata_dir = str((bp / "userdata").resolve())
+
+        # Create empty marker file (truncate to clear any prior content)
+        Path(bp_str + ".worker_result").write_text("", encoding="utf-8")
+
+        def launch_and_wait(delay: float) -> None:
+            # Build the worker as a self-contained script. Paths are passed
+            # via env vars (no shell escaping concerns) and the result is
+            # written to a known file. JSON-quoted in source but embedded
+            # as Python repr (so the runtime gets proper string escaping).
+            bp_esc = bp_str.replace("\\", "\\\\").replace("'", "\\'")
+            userdata_esc = userdata_dir.replace("\\", "\\\\").replace("'", "\\'")
+            result_esc = (bp_str + ".worker_result").replace("\\", "\\\\").replace("'", "\\'")
+            code = (
+                "import sys, json, time, os\n"
+                f"sys.path.insert(0, {json.dumps(str(bp.parent.parent.parent))!r})\n"
+                "for k in list(sys.modules.keys()):\n"
+                "    if 'osint_cache' in k or k.startswith('userdata.'):\n"
+                "        del sys.modules[k]\n"
+                "from Heart.tools import osint_cache as m\n"
+                f"os.environ['USERDATA_DIR'] = r'{userdata_esc}'\n"
+                f"time.sleep({delay!r})\n"
+                f"result = m.run_phase(r'{bp_esc}')\n"
+                f"with open(r'{result_esc}', 'a', encoding='utf-8') as f:\n"
+                "    f.write(json.dumps({'ok': result['ok'], 'new_ips': result.get('new_ips', -1)}) + '\\n')\n"
+            )
+            proc = subprocess.run(
+                [sys.executable, "-c", code],
+                capture_output=True, text=True, timeout=90,
+            )
+            if proc.returncode != 0:
+                errors.append(proc.stderr)
+
+        t1 = threading.Thread(target=launch_and_wait, args=(0.0,))
+        t2 = threading.Thread(target=launch_and_wait, args=(0.05,))
+        result_file = Path(bp_str + ".worker_result")
+        try:
+            t1.start()
+            t2.start()
+            t1.join(timeout=60)
+            t2.join(timeout=60)
+
+            for _ in range(10):
+                try:
+                    lines = result_file.read_text(encoding="utf-8").strip().splitlines()
+                    if lines:
+                        results = [json.loads(line) for line in lines if line.strip()]
+                        if len(results) >= 2:
+                            break
+                except (FileNotFoundError, ValueError):
+                    pass
+                _t.sleep(0.5)
+
+            assert not t1.is_alive(), "worker-1 did not complete within 60s"
+            assert not t2.is_alive(), "worker-2 did not complete within 60s"
+            assert not errors, f"subprocess errors: {errors}"
+            assert len(results) >= 2, f"expected 2 result lines, got {len(results)}: {results}"
+            assert all(r["ok"] for r in results), f"some run_phase failed: {results}"
+            new_ips_total = sum(r["new_ips"] for r in results)
+            assert new_ips_total == 1, (
+                f"expected exactly 1 new_ip total (no double-count), got {new_ips_total}: {results}"
+            )
+        finally:
+            try:
+                result_file.unlink()
+            except OSError:
+                pass
+
+
+class TestRunPhaseLockContract:
+    """Regression tests for the _release_lock(lock) contract.
+
+    Bug (pre-session): osint_cache.run_phase finally-block called
+    _release_lock(lock_path) (a WindowsPath) instead of _release_lock(lock)
+    (the FileLock object returned by _acquire_lock). This raised
+    AttributeError because Path has no .release(). The fix: pass the FileLock
+    object so .release() is called and _locked is set to False.
+    """
+
+    def test_release_lock_accepts_filelock_and_sets_locked_false(self, osint_mod, bp):
+        """Calling _release_lock with a FileLock must call .release() and set
+        _locked=False. If this fails, the finally-block is passing the wrong
+        variable (a Path instead of a FileLock object)."""
+        lock_path = bp / "heartbeat" / ".contract_test.lock"
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            lock = osint_mod._acquire_lock(lock_path, timeout_s=5)
+            assert lock._locked is True, "precondition: lock should be acquired"
+            osint_mod._release_lock(lock)
+            assert lock._locked is False, (
+                "lock._locked must be False after _release_lock; "
+                "if this fails, _release_lock received a Path instead of a FileLock"
+            )
+        finally:
+            try:
+                lock_path.unlink()
+            except OSError:
+                pass
+
+    def test_release_lock_rejects_path_with_attributerror(self, osint_mod, tmp_path):
+        """Passing a Path to _release_lock raises AttributeError — not silently
+        succeeding. This documents the bug: a Path has no .release() method."""
+        import pytest
+        with pytest.raises(AttributeError, match="'WindowsPath'"):
+            osint_mod._release_lock(tmp_path / "fake.lock")

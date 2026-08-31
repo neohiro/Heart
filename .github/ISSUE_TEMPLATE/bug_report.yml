@@ -1,0 +1,43 @@
+name: Bug Report
+description: File a bug report
+title: "[Bug] "
+labels: ["bug"]
+assignees: []
+body:
+
+- type: markdown
+  attributes:
+    value: |
+      ## Bug Report
+
+- type: textarea
+  id: what-happened
+  attributes:
+    label: What happened?
+    description: A clear description of what the bug is.
+  validations:
+    required: true
+
+- type: textarea
+  id: reproduce
+  attributes:
+    label: Steps to reproduce
+    description: Minimal steps to reproduce the behaviour.
+  validations:
+    required: true
+
+- type: textarea
+  id: expected
+  attributes:
+    label: Expected behaviour
+    description: What did you expect to happen?
+  validations:
+    required: true
+
+- type: textarea
+  id: env
+  attributes:
+    label: Environment
+    description: OS, Python version, Heart commit, etc.
+  validations:
+    required: false

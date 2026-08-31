@@ -18,6 +18,7 @@ Commands:
     trigger             — trigger a single Heart cycle (calls heart.py --once)
     watch               — tail the audit log in real time
     doctor              — run neohiro-doctor checks and print report
+    doctor-deep         — cross-check /healthz, .heartbeat, and repo_summary (see test_doctor_deep.py)
     env-check           — verify all required environment variables are set
     visitor-counters    — run a single visitor_counter_scraper cycle
     social-counters     — run a single social_counter_poll cycle
@@ -44,6 +45,7 @@ import subprocess
 import sys
 import time
 import uuid
+import warnings
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, NoReturn
@@ -96,11 +98,19 @@ def cmd_status(_args: argparse.Namespace) -> int:
 
 def cmd_mode(args: argparse.Namespace) -> int:
     mode_file = BRAIN_PATH / "heartbeat" / "mode.yaml"
-    mode_file.parent.mkdir(parents=True, exist_ok=True)
     if args.mode_value:
-        mode_file.write_text(f"mode: {args.mode_value}\n")
+        # Reject whitespace-only mode strings before mkdir/write to avoid
+        # creating an empty mode.yaml. argparse gives us a str here, so
+        # .strip() is always safe.
+        if not args.mode_value.strip():
+            print("heartctl: error: mode_value is empty or whitespace", file=sys.stderr)
+            return 1
+        mode_file.parent.mkdir(parents=True, exist_ok=True)
+        from atomic import write_text
+        write_text(mode_file, f"mode: {args.mode_value}\n")
         print(f"mode set to: {args.mode_value}")
         return 0
+    mode_file.parent.mkdir(parents=True, exist_ok=True)
     current = _read_yaml(mode_file).get("mode", "normal")
     print(current)
     return 0
@@ -163,6 +173,14 @@ def cmd_phase(args: argparse.Namespace) -> int:
     import heart as _heart_module
     _heart_module.BRAIN_PATH = BRAIN_PATH
 
+    # Honour --dry-run: gate both the module-level DRY_RUN flag (used by
+    # heart.py writers) AND the HEART_DRY_RUN env var (consumed by
+    # heart_shared_prune._is_dry_run). Both must be set for the dry-run
+    # contract to hold end-to-end.
+    if getattr(args, "dry_run", False):
+        _heart_module.DRY_RUN = True
+        os.environ["HEART_DRY_RUN"] = "1"
+
     state = _heart_module.CycleState()
     state.repos = _heart_module._discover_orgs_from_entities()
     state.repos.extend(_heart_module._load_repos_yaml())
@@ -184,6 +202,8 @@ def cmd_phase(args: argparse.Namespace) -> int:
         "self_heal": _heart_module._phase_self_heal,
         "self_reflexive_check": _heart_module._phase_self_reflexive_check,
         "intuition_deliberate": _heart_module._phase_intuition_deliberate,
+        "grounding_audit": _heart_module._phase_grounding_audit,
+        "prune_shared": _heart_module._phase_prune_shared,
         "audit": _heart_module._phase_audit,
     }
 
@@ -311,6 +331,561 @@ def cmd_doctor(_args: argparse.Namespace) -> int:
     return 0 if all_ok else 1
 
 
+# ─── doctor --deep (cross-checks /healthz + /shared/.heartbeat + repo_summary) ─
+#
+# Constants used by the deep doctor check.
+HEARTBEAT_FILE = "/shared/.heartbeat"
+_HEARTBEAT_MAX_AGE_DEFAULT = 90
+CYCLE_DRIFT_THRESHOLD = 5
+_SKEW_TOLERANCE_S = 2
+# Maximum bytes to read from /healthz before aborting.  The Go sidecar
+# emits a ~200-byte JSON object.  A 1 MB cap is 5000x the normal size and
+# prevents a malicious or misconfigured server from exhausting doctor RAM.
+_MAX_HEALTHZ_BYTES = 1 * 1024 * 1024
+# Maximum bytes to read from repo_summary.json before rejecting.  A file
+# larger than this is treated as missing/corrupt and returns None.  Tunable
+# via this constant so an operator can adjust without changing the code.
+_MAX_REPO_SUMMARY_BYTES = 10 * 1024 * 1024
+# Maximum heartbeat file size to read for sentinel validation.
+# The Go sidecar writes ~12 bytes.  Reject anything >> that to prevent a
+# malicious or accidental large-file write from exhausting doctor RAM.
+_MAX_HEARTBEAT_SENTINEL_BYTES = 10 * 1024
+# Maximum diagnostic JSON files to keep in Brain's knowledge base.
+# Older files are pruned after each run to prevent unbounded disk usage.
+_MAX_KB_DOCTOR_DEEP_FILES = 100
+
+
+def _resolve_healthz_max_age() -> int:
+    """Resolve HEARTBEAT_MAX_AGE env, defaulting to 90s on bad/missing input.
+
+    Re-read on every call (cheap), so an operator who tweaks the sidecar
+    doesn't need a heartctl restart.  Wraps in try/except so a malformed
+    env var (e.g. "abc", "", "0") never crashes the import path.
+    """
+    raw = os.environ.get("HEARTBEAT_MAX_AGE", str(_HEARTBEAT_MAX_AGE_DEFAULT))
+    try:
+        v = int(raw)
+    except (TypeError, ValueError):
+        return _HEARTBEAT_MAX_AGE_DEFAULT
+    return v if v >= 1 else _HEARTBEAT_MAX_AGE_DEFAULT
+
+
+def _resolve_skew_tolerance_s() -> int:
+    """Resolve HEART_SKEW_TOLERANCE_S env, defaulting to 2s on bad/missing input.
+
+    Allows operators on systems with poor clock discipline (virtualized hosts,
+    suspended laptops, Raspberry Pi) to increase the tolerance without a code
+    change.  Bad/missing env falls back to the module-level default.
+    """
+    raw = os.environ.get("HEART_SKEW_TOLERANCE_S", str(_SKEW_TOLERANCE_S))
+    try:
+        v = int(raw)
+    except (TypeError, ValueError):
+        return _SKEW_TOLERANCE_S
+    return v if v >= 0 else _SKEW_TOLERANCE_S
+
+
+def _fetch_healthz(port: int, timeout: float = 2.0) -> dict | None:
+    """Return the parsed /healthz JSON, or None on any failure.
+
+    Uses a raw socket (not urllib) for two reasons:
+      1. urllib follows http_proxy/HTTPS_PROXY env vars by default. A
+         127.0.0.1 healthcheck could be mis-routed to an external proxy
+         if the operator has those vars set in their shell.
+      2. urllib does DNS resolution; we want this call to be hermetic
+         and never touch the network beyond the local interface.
+
+    The response is capped at _MAX_HEALTHZ_BYTES to prevent a malicious or
+    misconfigured server from exhausting the doctor process's RAM.
+    """
+    import re as _re
+    import socket
+
+    truncated = False
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=timeout) as s:
+            s.sendall(b"GET /healthz HTTP/1.1\r\nHost: localhost\r\n"
+                      b"Connection: close\r\n\r\n")
+            chunks: list[bytes] = []
+            total = 0
+            while total < _MAX_HEALTHZ_BYTES:
+                buf = s.recv(4096)
+                if not buf:
+                    break
+                chunks.append(buf)
+                total += len(buf)
+            else:
+                truncated = True
+    except OSError:
+        return None
+
+    if truncated:
+        return None
+    if not chunks:
+        return None
+    raw = b"".join(chunks)
+
+    # Split headers from body at the first blank line.
+    # Accept both RFC-compliant \r\n\r\n and lenient \n\n.
+    sep_idx = raw.find(b"\r\n\r\n")
+    if sep_idx >= 0:
+        header_part = raw[:sep_idx]
+        body = raw[sep_idx + 4:]
+    else:
+        sep_idx = raw.find(b"\n\n")
+        if sep_idx >= 0:
+            header_part = raw[:sep_idx]
+            body = raw[sep_idx + 2:]
+        else:
+            return None
+
+    # Parse the status line (the first line of the response) to extract the
+    # HTTP status code.  The status line is the first line before any \n or \r.
+    first_lines = header_part.split(b"\n")
+    if not first_lines:
+        return None
+    status_line = first_lines[0]
+    # RFC 7230 §3.1: status-line = HTTP-version SP status-code SP reason-phrase
+    # e.g. "HTTP/1.1 200 OK".  Extract only the 3-digit status code.
+    m = _re.fullmatch(rb"HTTP/1\.[01] (\d{3}) .*", status_line)
+    if not m or m.group(1) != b"200":
+        return None
+
+    # Strip any chunked-transfer encoding trailer.
+    if b"chunked" in header_part.lower():
+        body = _decode_chunked(body)
+
+    try:
+        return json.loads(body.decode("utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None
+
+
+def _decode_chunked(body: bytes) -> bytes:
+    """Decode HTTP chunked Transfer-Encoding for a single final chunk.
+
+    Handles the Go sidecar's typical case: one non-zero-size chunk followed by
+    the final 0\r\n\r\n terminator.  On receipt of the first size==0 chunk the
+    decoder stops — any data after that point ( trailers, extra zero-chunks)
+    is discarded.  This matches what the Go stdlib emits for a small JSON
+    response: a single chunk that carries the entire body.
+    """
+    import re as _re
+    result: list[bytes] = []
+    remaining = body
+    while remaining:
+        # Each chunk: <size-in-hex> CRLF <data> CRLF  (or final: 0 CRLF)
+        m = _re.match(rb"([0-9a-fA-F]+)\r\n", remaining)
+        if not m:
+            break
+        size = int(m.group(1), 16)
+        if size == 0:
+            break
+        data_start = m.end()
+        data_end = data_start + size
+        result.append(remaining[data_start:data_end])
+        remaining = remaining[data_end:]
+        if remaining.startswith(b"\r\n"):
+            remaining = remaining[2:]
+    return b"".join(result)
+
+
+def _read_repo_summary() -> dict | None:
+    """Return the on-disk repo_summary.json dict, or None if missing/corrupt.
+
+    Capped at _MAX_REPO_SUMMARY_BYTES (10 MB by default) to prevent a hostile
+    or accidentally-huge file from OOM'ing the doctor process.  10 MB is ~50x
+    the current typical size (~200 KB) so a real-world OOM condition is the
+    only thing this would ever reject.
+    """
+    path = BRAIN_PATH / "heartbeat" / "repo_summary.json"
+    if not path.is_file():
+        return None
+    try:
+        size = path.stat().st_size
+        if size > _MAX_REPO_SUMMARY_BYTES:
+            return None
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+HEARTBEAT_SENTINEL_MARKER = b"heartbeat: OK\n"
+
+
+def _check_heartbeat_content_is_sentinel(path: Path) -> bool:
+    """Check if /shared/.heartbeat contains the expected sentinel.
+
+    Returns True if content matches HEARTBEAT_SENTINEL_MARKER, False otherwise.
+    Rejects files larger than _MAX_HEARTBEAT_SENTINEL_BYTES to prevent
+    memory exhaustion from a malicious or accidental large-file write.
+    """
+    try:
+        if not path.is_file():
+            return False
+        st = path.stat()
+        if st.st_size > _MAX_HEARTBEAT_SENTINEL_BYTES:
+            return False
+        content = path.read_bytes()
+        return content == HEARTBEAT_SENTINEL_MARKER
+    except OSError:
+        return False
+
+
+def _check_healthz_vs_heartbeat() -> list[str]:
+    """Compare /healthz JSON to /shared/.heartbeat mtime. Returns a list of
+    drift messages; empty list means the two sources agree."""
+    return _doctor_diagnose()["drift"]
+
+
+def _doctor_diagnose(health_port: int | None = None) -> dict:
+    """Return a structured diagnosis of /healthz + .heartbeat + repo_summary.
+
+    Returns a dict suitable for both human rendering and machine parsing
+    (consumed by cmd_doctor_deep --json and by the Brain self-improvement
+    pass for richer inputs).
+
+    Keys:
+        ok (bool)              — True if all drift checks passed
+        drift (list[str])      — human-readable drift messages (empty when ok)
+        max_age_s (int)        — HEARTBEAT_MAX_AGE effective value
+        skew_tolerance_s (int) — HEART_SKEW_TOLERANCE_S effective value
+        mtime_age_s (int|None) — seconds since .heartbeat was touched, None if missing
+        sentinel_valid (bool)  — True if .heartbeat contains the canonical sentinel
+        healthz_reachable (bool) — True if /healthz responded with a parseable body
+        healthz_cycle (int|None) — cycle value from /healthz, None if unreachable
+        repo_cycle (int|None) — cycle value from repo_summary, None if missing/corrupt
+        health_port (int|None) — port used for /healthz
+        error (str|None)       — fatal error preventing further checks (e.g. bad port)
+    """
+    max_age = _resolve_healthz_max_age()
+    skew_tolerance = _resolve_skew_tolerance_s()
+    diagnosis: dict = {
+        "ok": True,
+        "drift": [],
+        "max_age_s": max_age,
+        "skew_tolerance_s": skew_tolerance,
+        "mtime_age_s": None,
+        "sentinel_valid": False,
+        "healthz_reachable": False,
+        "healthz_cycle": None,
+        "repo_cycle": None,
+        "health_port": None,
+        "error": None,
+    }
+
+    hb_path = Path(HEARTBEAT_FILE)
+    if not hb_path.is_file():
+        diagnosis["drift"].append(
+            "no .heartbeat file at /shared/.heartbeat — Heart may be down"
+        )
+        diagnosis["ok"] = False
+        return diagnosis
+
+    port_env = os.environ.get("HEART_HEALTH_PORT", "9090")
+    if health_port is not None:
+        # CLI flag overrides env var
+        port = health_port
+    else:
+        try:
+            port = int(port_env)
+        except ValueError:
+            diagnosis["error"] = f"HEART_HEALTH_PORT is not an integer: {port_env!r}"
+            diagnosis["ok"] = False
+            diagnosis["drift"].append(diagnosis["error"])
+            return diagnosis
+    if not (1 <= port <= 65535):
+        diagnosis["error"] = f"HEART_HEALTH_PORT out of range: {port}"
+        diagnosis["ok"] = False
+        diagnosis["drift"].append(diagnosis["error"])
+        return diagnosis
+    diagnosis["health_port"] = port
+
+    healthz = _fetch_healthz(port)
+    if healthz is None:
+        diagnosis["drift"].append(
+            f"/healthz on 127.0.0.1:{port} unreachable — "
+            f"Go binary may not be running, or port blocked"
+        )
+        diagnosis["ok"] = False
+        return diagnosis
+    diagnosis["healthz_reachable"] = True
+    try:
+        diagnosis["healthz_cycle"] = int(healthz.get("cycle", 0) or 0)
+    except (TypeError, ValueError):
+        diagnosis["healthz_reachable"] = False
+        diagnosis["drift"].append(
+            f"/healthz returned non-integer cycle: {healthz.get('cycle')!r}"
+        )
+        diagnosis["ok"] = False
+        return diagnosis
+
+    now = time.time()
+    try:
+        mt = hb_path.stat().st_mtime
+    except OSError as e:
+        diagnosis["error"] = f"cannot stat {HEARTBEAT_FILE}: {e}"
+        diagnosis["ok"] = False
+        diagnosis["drift"].append(diagnosis["error"])
+        return diagnosis
+    age = int(now - mt)
+    diagnosis["mtime_age_s"] = age
+    if age < -skew_tolerance:
+        diagnosis["drift"].append(
+            f"clock skew: .heartbeat mtime is {abs(age)}s in the future"
+        )
+        diagnosis["ok"] = False
+    elif age > max_age:
+        diagnosis["drift"].append(
+            f"stale .heartbeat: age={age}s > max={max_age}s "
+            f"(container may be wedged even though /healthz responds)"
+        )
+        diagnosis["ok"] = False
+
+    if _check_heartbeat_content_is_sentinel(hb_path):
+        diagnosis["sentinel_valid"] = True
+    else:
+        # Reason for rejection: oversized, missing, or content mismatch.
+        # _check_heartbeat_content_is_sentinel returns False in all cases
+        # without distinguishing them; the doctor surface only needs to
+        # know the sentinel does not match.
+        diagnosis["drift"].append(
+            f".heartbeat file corrupted or missing sentinel: "
+            f"{HEARTBEAT_SENTINEL_MARKER!r}"
+        )
+        diagnosis["ok"] = False
+
+    repo = _read_repo_summary()
+    if repo is not None:
+        try:
+            repo_cycle = int(repo.get("cycle") or 0)
+        except (TypeError, ValueError):
+            repo_cycle = None
+            diagnosis["drift"].append(
+                f"repo_summary returned non-integer cycle: {repo.get('cycle')!r}"
+            )
+            diagnosis["ok"] = False
+        else:
+            diagnosis["repo_cycle"] = repo_cycle
+            if diagnosis["healthz_cycle"] is not None and diagnosis["healthz_cycle"] < repo_cycle:
+                diagnosis["drift"].append(
+                    f"cycle regression: /healthz.cycle={diagnosis['healthz_cycle']} < "
+                    f"repo_summary.cycle={repo_cycle} (Go binary restarted?)"
+                )
+                diagnosis["ok"] = False
+            elif (
+                diagnosis["healthz_cycle"] is not None
+                and diagnosis["healthz_cycle"] - repo_cycle > CYCLE_DRIFT_THRESHOLD
+            ):
+                diagnosis["drift"].append(
+                    f"cycle drift: /healthz.cycle={diagnosis['healthz_cycle']} is "
+                    f"{diagnosis['healthz_cycle'] - repo_cycle} ahead of repo_summary "
+                    f"(writes are lagging; check disk)"
+                )
+                diagnosis["ok"] = False
+    return diagnosis
+
+
+def _doctor_self_heal(diagnosis: dict, hb_path: Path | None = None) -> dict:
+    """Attempt to remediate fixable drift. Returns a dict of actions taken.
+
+    Self-healable drift classes:
+      - stale .heartbeat (mtime drift)        → touch the file
+      - corrupted .heartbeat (sentinel drift) → write the canonical sentinel
+    Non-self-healable:
+      - /healthz unreachable                  → operator must restart Go binary
+      - cycle regression / cycle drift        → operator must inspect the disk
+
+    hb_path: override for HEARTBEAT_FILE (used by tests).  Defaults to the
+    module-level constant.
+    """
+    actions = {
+        "touched_heartbeat": False,
+        "regenerated_heartbeat": False,
+        "errors": [],
+    }
+    if diagnosis.get("ok"):
+        return actions
+    hb_path = hb_path if hb_path is not None else Path(HEARTBEAT_FILE)
+    drift_msgs = diagnosis.get("drift", [])
+
+    # Sentinel corruption: write the canonical content
+    sentinel_corrupt = any("corrupted" in d for d in drift_msgs)
+    if sentinel_corrupt and hb_path.is_file():
+        tmp = hb_path.with_suffix(hb_path.suffix + ".heal")
+        try:
+            tmp.write_bytes(HEARTBEAT_SENTINEL_MARKER)
+            tmp.replace(hb_path)
+            os.utime(hb_path)
+            actions["regenerated_heartbeat"] = True
+        except OSError as e:
+            actions["errors"].append(f"regenerate failed: {e}")
+            # Clean up the orphan temp on any failure so /shared doesn't
+            # accumulate stale .heal files after a failed write.
+            try:
+                if tmp.exists():
+                    tmp.unlink()
+            except OSError:
+                pass
+        return actions
+
+    # Stale mtime: touch the file to refresh
+    stale = any("stale" in d for d in drift_msgs)
+    if stale and hb_path.is_file():
+        try:
+            os.utime(hb_path)
+            actions["touched_heartbeat"] = True
+        except OSError as e:
+            actions["errors"].append(f"touch failed: {e}")
+
+    return actions
+
+
+def cmd_doctor_deep(args: argparse.Namespace) -> int:
+    """Deep doctor: cross-check /healthz, /shared/.heartbeat, and repo_summary.
+
+    Use when an alert says "Heart unhealthy" and you need to know which
+    invariant is broken.  Each drift is reported with a specific remediation
+    hint.  With --json, emits machine-readable JSON to stdout.
+
+    Self-healable drift classes (stale mtime, sentinel corruption) can be
+    remediated automatically with --self-heal.  The diagnostic JSON is also
+    written to Brain's knowledge base for the self-improvement pass.
+    """
+    d = _doctor_diagnose(health_port=getattr(args, "health_port", None))
+
+    # Export diagnostic to Brain for self-improvement pass
+    _doctor_export_diagnostic(d)
+
+    do_self_heal = getattr(args, "self_heal", False) or getattr(args, "fix_heartbeat", False)
+    if getattr(args, "fix_heartbeat", False):
+        warnings.warn(
+            "--fix-heartbeat is deprecated; use --self-heal instead",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+    # JSON output — structured machine-readable format
+    if getattr(args, "json", False):
+        out: dict = {
+            "ok": d["ok"],
+            "drift": d["drift"],
+            "sources": {
+                "heartbeat_mtime_age_s": d["mtime_age_s"],
+                "sentinel_valid": d["sentinel_valid"],
+                "healthz_reachable": d["healthz_reachable"],
+                "healthz_cycle": d["healthz_cycle"],
+                "repo_cycle": d["repo_cycle"],
+                "health_port": d["health_port"],
+                "max_age_s": d["max_age_s"],
+                "skew_tolerance_s": d["skew_tolerance_s"],
+            },
+            "error": d["error"],
+            "self_heal": None,
+        }
+        if do_self_heal and not d["ok"]:
+            actions = _doctor_self_heal(d)
+            out["self_heal"] = actions
+            if not actions["errors"] and (
+                actions["touched_heartbeat"] or actions["regenerated_heartbeat"]
+            ):
+                d2 = _doctor_diagnose(health_port=getattr(args, "health_port", None))
+                out["ok_after_heal"] = d2["ok"]
+                out["drift_after_heal"] = d2["drift"]
+                print(json.dumps(out, indent=2))
+                return 0 if d2["ok"] else 1
+        print(json.dumps(out, indent=2))
+        return 0 if d["ok"] else 1
+
+    # Human-readable output
+    print("=== Heart deep doctor ===")
+    print("(cross-checks /healthz, /shared/.heartbeat, repo_summary.json)")
+    print()
+
+    rc = 0
+    if d["ok"]:
+        print("  [OK] all three sources agree")
+        print(f"        /shared/.heartbeat: mtime ≤ {d['max_age_s']}s ago")
+        print(f"        sentinel: {'valid' if d['sentinel_valid'] else 'MISSING/CORRUPT'}")
+        print(f"        /healthz: reachable (cycle={d['healthz_cycle']})")
+        print(f"        repo_summary: cycle={d['repo_cycle']}")
+    else:
+        print(f"  [DRIFT] found {len(d['drift'])} mismatch(es):")
+        for msg in d["drift"]:
+            print(f"    - {msg}")
+        rc = 1
+
+    if do_self_heal and not d["ok"]:
+        print()
+        print("  [SELF-HEAL] attempting remediation...")
+        actions = _doctor_self_heal(d)
+        if actions["regenerated_heartbeat"]:
+            print(f"    [OK] regenerated .heartbeat with canonical sentinel")
+        if actions["touched_heartbeat"]:
+            print(f"    [OK] touched .heartbeat to refresh mtime")
+        if actions["errors"]:
+            for err in actions["errors"]:
+                print(f"    [ERROR] {err}")
+        if not actions["regenerated_heartbeat"] and not actions["touched_heartbeat"]:
+            print("    [SKIPPED] no self-healable drift found (unreachable /healthz, cycle regression, etc.)")
+        elif not actions["errors"]:
+            # Re-diagnose after self-heal so return code reflects current state
+            d_after = _doctor_diagnose(health_port=getattr(args, "health_port", None))
+            if d_after["ok"]:
+                print()
+                print("  [OK] all checks pass after self-heal")
+                rc = 0
+            else:
+                rc = 1
+
+    return rc
+
+
+def _doctor_export_diagnostic(d: dict) -> None:
+    """Write the doctor diagnostic to Brain's knowledge base.
+
+    Writes /shared/brain/knowledge/doctor_deep/<ts>.json so the Heart
+    self-improvement pass can read it and use the raw diagnostic fields
+    (not just the drift messages) to make better scheduling decisions.
+    """
+    try:
+        root = BRAIN_PATH
+        if not root.is_dir():
+            return
+        kb_dir = root / "knowledge" / "doctor_deep"
+        kb_dir.mkdir(parents=True, exist_ok=True)
+        ts = time.strftime("%Y%m%dT%H%M%S")
+        out = {
+            "ts": ts,
+            "ok": d["ok"],
+            "drift": d["drift"],
+            "sources": {
+                "heartbeat_mtime_age_s": d["mtime_age_s"],
+                "sentinel_valid": d["sentinel_valid"],
+                "healthz_reachable": d["healthz_reachable"],
+                "healthz_cycle": d["healthz_cycle"],
+                "repo_cycle": d["repo_cycle"],
+                "health_port": d["health_port"],
+                "max_age_s": d["max_age_s"],
+                "skew_tolerance_s": d["skew_tolerance_s"],
+            },
+            "error": d["error"],
+        }
+        path = kb_dir / f"{ts}.json"
+        from atomic import write_json
+        write_json(path, out, indent=2)
+        # Prune oldest files beyond the cap.  Sort by name (timestamp prefix)
+        # so lexicographic order matches chronological order.
+        existing = sorted(kb_dir.glob("*.json"))
+        if len(existing) > _MAX_KB_DOCTOR_DEEP_FILES:
+            for old in existing[: len(existing) - _MAX_KB_DOCTOR_DEEP_FILES]:
+                try:
+                    old.unlink()
+                except OSError:
+                    pass
+    except Exception:
+        pass
+
+
 def cmd_env_check(_args: argparse.Namespace) -> int:
     required = ["BRAIN_PATH"]
     optional = ["GH_TOKEN", "HEART_LOG_LEVEL", "NEWS_PATH", "CC_PATH"]
@@ -359,6 +934,21 @@ def cmd_social_counters(_args: argparse.Namespace) -> int:
     """Run one social_counter_poll.py cycle and print the result."""
     print("=== Heart social-counter scope ===")
     return _run_scopecmd("social-counters")
+
+
+def cmd_live_observer(args: argparse.Namespace) -> int:
+    """Run one live_observer_runner.py cycle (scan + emit, no daemon)."""
+    print("=== Heart live-observer scope (one-shot) ===")
+    script = Path(__file__).parent / "live_observer_runner.py"
+    if not script.is_file():
+        print(f"script not found: {script}", file=sys.stderr)
+        return 3
+    cmd = [sys.executable, str(script), "--quiet", "--once"]
+    if getattr(args, "roots", ""):
+        cmd[1:1] = ["--roots", args.roots]
+    print(f"$ {' '.join(cmd)}")
+    result = subprocess.run(cmd, env=os.environ.copy(), check=False)
+    return result.returncode
 
 
 # ─── Router (per LLM_ROUTER_CASCADE.md § 2) ────────────────────────────────
@@ -766,6 +1356,11 @@ def main() -> int:
 
     ph = sub.add_parser("phase", help="run a single phase and print JSON result")
     ph.add_argument("phase_name", help="phase to run (e.g. discover_repos)")
+    ph.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="set HEART_DRY_RUN=1 + heart.DRY_RUN=True so writes are skipped",
+    )
 
     t = sub.add_parser("trigger", help="trigger a single Heart cycle")
     t.add_argument("--dry-run", action="store_true")
@@ -773,6 +1368,16 @@ def main() -> int:
     sub.add_parser("watch", help="tail the audit log in real time")
 
     sub.add_parser("doctor", help="run neohiro-doctor checks")
+
+    dd = sub.add_parser("doctor-deep", help="cross-check /healthz, .heartbeat, and repo_summary (see test_doctor_deep.py)")
+    dd.add_argument("--fix-heartbeat", action="store_true",
+                    help="(deprecated) touch /shared/.heartbeat to refresh mtime; prefer --self-heal")
+    dd.add_argument("--self-heal", action="store_true",
+                    help="attempt to remediate fixable drift (stale mtime, sentinel corruption)")
+    dd.add_argument("--json", action="store_true",
+                    help="emit JSON diagnostic to stdout (machine-readable)")
+    dd.add_argument("--health-port", type=int, default=None,
+                    help="port to probe /healthz on (default: $HEART_HEALTH_PORT or 9090)")
 
     sub.add_parser("env-check", help="verify environment variables")
 
@@ -783,6 +1388,15 @@ def main() -> int:
     sub.add_parser(
         "social-counters",
         help="run one social_counter_poll.py cycle (see Heart/schedules/REGISTRY.yaml)",
+    )
+
+    lo = sub.add_parser(
+        "live-observer",
+        help="run one live_observer_runner.py --once cycle (see Heart/schedules/REGISTRY.yaml)",
+    )
+    lo.add_argument(
+        "--roots", default="",
+        help="override roots (scope:path pairs, comma-sep); default: discover from Brain/_entities/",
     )
 
     r = sub.add_parser(
@@ -870,9 +1484,11 @@ def main() -> int:
         "trigger": cmd_trigger,
         "watch": cmd_watch,
         "doctor": cmd_doctor,
+        "doctor-deep": cmd_doctor_deep,
         "env-check": cmd_env_check,
         "visitor-counters": cmd_visitor_counters,
         "social-counters": cmd_social_counters,
+        "live-observer": cmd_live_observer,
         "router": cmd_router,
         "delegate": cmd_delegate,
         "delegate-watch": cmd_watch_session,

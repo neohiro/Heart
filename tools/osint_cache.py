@@ -98,40 +98,23 @@ def _safe_filename(s: str, fallback: str = "x") -> str:
     return "".join(c if c.isalnum() or c in "._-" else "_" for c in s) or fallback
 
 
-def _acquire_lock(lock_path: Path, timeout_s: int = 30) -> Path:
+def _acquire_lock(lock_path: Path, timeout_s: int = 30) -> FileLock:
     """
-    Acquire an exclusive file-based lock using mkdir(2) semantics.
+    Acquire an exclusive file-based lock using fcntl (POSIX) or msvcrt (Windows).
 
-    mkdir is atomic on both POSIX and Windows NT, so this works cross-platform
-    without any fcntl / msvcrt imports. On success returns the lockfile path.
+    This is a proper advisory lock that is automatically released when the
+    process exits (even on crash/SIGKILL). No stale lock detection needed.
+
+    On success returns the FileLock object (must call .release() when done).
     On timeout raises TimeoutError.
-
-    Lock is released by rmdir() — mkdir creates the lock as a directory so that
-    the existence-check and create are one atomic syscall.
     """
-    import time
-
-    deadline = time.monotonic() + timeout_s
-    while True:
-        try:
-            lock_path.mkdir(parents=True, exist_ok=False)
-            return lock_path
-        except FileExistsError:
-            if time.monotonic() >= deadline:
-                raise TimeoutError(f"Could not acquire lock {lock_path} within {timeout_s}s — another process is running ingest_osint")
-            time.sleep(0.1)
+    from atomic import acquire_file_lock
+    return acquire_file_lock(lock_path, timeout_s=timeout_s)
 
 
-def _release_lock(lock_path: Path) -> None:
-    """Release a lock by removing the lockfile. Best-effort.
-
-    The lock is a directory (mkdir is atomic cross-platform), so unlink would
-    fail on POSIX and Windows alike. Use rmdir instead.
-    """
-    try:
-        lock_path.rmdir()
-    except OSError:
-        pass
+def _release_lock(lock: FileLock) -> None:
+    """Release a lock acquired via _acquire_lock."""
+    lock.release()
 
 
 # ── IP hashing (privacy-first) ─────────────────────────────────────────────
@@ -163,12 +146,13 @@ def _hash_ip(raw_ip: str) -> str:
 
 
 # ── Atomic write ────────────────────────────────────────────────────────────
+# Uses the centralized atomic module (Heart/tools/atomic.py) for atomicity and
+# concurrent-writer safety.
 
 def _atomic_write(path: Path, data: dict) -> None:
-    """Write atomically: temp file + rename. Rename is atomic on POSIX and Windows."""
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(data, indent=2, default=str), encoding="utf-8")
-    tmp.replace(path)
+    """Write atomically using the shared atomic module."""
+    from atomic import write_json
+    write_json(path, data, prefix=f".{path.name}.")
 
 
 # ── Dedup fingerprint (stable-state hash) ──────────────────────────────────
@@ -280,10 +264,7 @@ def _enqueue_pending_userdata(brain_path: Path, ip_hash: str, payload: dict) -> 
     pending.mkdir(parents=True, exist_ok=True)
     ts = _now().replace(":", "-").replace(".", "-").replace("+", "-")
     fname = f"userdata_pending_{_safe_filename(ip_hash)}_{ts}.json"
-    (pending / fname).write_text(
-        json.dumps({"ip_hash": ip_hash, "payload": payload}, default=str),
-        encoding="utf-8",
-    )
+    _atomic_write(pending / fname, {"ip_hash": ip_hash, "payload": payload})
 
 
 def _drain_pending_userdata(brain_path: Path, remaining_quota: int) -> int:
@@ -480,8 +461,9 @@ def _amend_observation(existing: Optional[dict], raw: dict) -> dict:
             if v is not None:
                 existing[f"enrich_{k}"] = v
 
-    if existing.get("_signal") == "new_ip":
-        return existing
+    # Clear per-cycle signal at start of amendment.
+    # Signal is set only when a status CHANGE is detected in this cycle.
+    existing.pop("_signal", None)
 
     # Update last_seen — keeps observation alive (self-renewing TTL)
     existing["last_seen"] = now
@@ -497,13 +479,22 @@ def _amend_observation(existing: Optional[dict], raw: dict) -> dict:
         existing["last_country_code"] = new_country
         existing["_signal"] = "geo_drift"
 
-    # VPN/Tor/Proxy status changes
+    # VPN/Tor/Proxy status changes — collect all changed flags
+    vpn_tor_proxy_changed = []
     for flag in ("is_vpn", "is_tor", "is_proxy"):
         was = existing.get(flag, False)
         now_flag = bool(raw.get(flag))
         if now_flag and not was:
             existing[flag] = True
-            existing.setdefault("_signal", flag)
+            vpn_tor_proxy_changed.append(flag)
+
+    # Set _signal: prioritize geo_drift > vpn/tor/proxy > new_ip
+    # If multiple vpn/tor/proxy change, use the first one (they're mutually exclusive in practice)
+    if existing.get("_signal") == "geo_drift":
+        pass  # geo_drift already set, keep it
+    elif vpn_tor_proxy_changed:
+        existing["_signal"] = vpn_tor_proxy_changed[0]
+    # else: keep _signal cleared (no change this cycle)
 
     # Merge stable surface fields (only overwrite if non-empty)
     for field in ("country", "country_code", "isp"):
@@ -524,21 +515,25 @@ def _amend_observation(existing: Optional[dict], raw: dict) -> dict:
 
 # ── Load incoming raw observations from signals_incoming/ ───────────────────
 
-def _load_incoming(brain_path: Path) -> list[dict]:
-    """READ: collect raw observation files dropped by OSINT producers."""
+def _load_incoming(brain_path: Path) -> list[tuple[dict, Path]]:
+    """READ: collect raw observation files dropped by OSINT producers.
+    
+    Returns a list of (raw_observation, file_path) tuples. File deletion is
+    deferred until after the cache is successfully saved, so a crash between
+    parsing and saving does not lose the observation.
+    """
     incoming = brain_path / "heartbeat" / SIGNALS_INCOMING_DIR
     if not incoming.exists():
         return []
 
-    observations = []
+    observations: list[tuple[dict, Path]] = []
     for p in sorted(incoming.glob("*.json")):
         try:
             raw = json.loads(p.read_text(encoding="utf-8"))
             if not raw.get("ip"):
                 p.unlink()
                 continue
-            observations.append(raw)
-            p.unlink()
+            observations.append((raw, p))
         except (json.JSONDecodeError, OSError):
             try:
                 p.unlink()
@@ -580,7 +575,7 @@ def enqueue_signal(
 
     ts = _now().replace(":", "-").replace(".", "-").replace("+", "-")
     fname = f"osint_{_safe_filename(signal_type)}_{_safe_filename(ip_hash)}_{ts}.json"
-    (inbox / fname).write_text(json.dumps(signal), encoding="utf-8")
+    _atomic_write(inbox / fname, signal)
 
 
 # ── Top-level run_phase ─────────────────────────────────────────────────────
@@ -612,24 +607,39 @@ def run_phase(brain_path: str | Path) -> dict:
     start = datetime.now(timezone.utc)
     bp = Path(brain_path)
     userdata_dir = Path(os.environ.get("USERDATA_DIR", "/var/lib/userdata"))
-    max_writes = int(os.environ.get(
-        "USERDATA_MAX_WRITES_PER_CYCLE", _DEFAULT_USERDATA_MAX_WRITES_PER_CYCLE
-    ))
+    try:
+        max_writes = int(os.environ.get(
+            "USERDATA_MAX_WRITES_PER_CYCLE", _DEFAULT_USERDATA_MAX_WRITES_PER_CYCLE
+        ))
+    except ValueError:
+        max_writes = _DEFAULT_USERDATA_MAX_WRITES_PER_CYCLE
+
+    # Acquire cross-process lock BEFORE draining pending. The lock must
+    # cover the drain so two parallel processes (Python bridge + Go
+    # reference) don't both see the same pending files and both proceed
+    # to write past the per-cycle cap.
+    lock_path = bp / "heartbeat" / ".osint_run_phase.lock"
+    try:
+        lock = _acquire_lock(lock_path, timeout_s=30)
+    except TimeoutError:
+        # Lock not acquired — surface the error without proceeding.
+        return {
+            "phase": "ingest_osint",
+            "ok": False,
+            "reason": "lock_timeout",
+            "lock_path": str(lock_path),
+        }
+
     # Pending writes from prior cycles count against this cycle's budget.
     pending_drained = _drain_pending_userdata(bp, max_writes)
     writes_remaining = max(0, max_writes - pending_drained)
 
-    # Acquire cross-process lock for the duration of the phase. The Python
-    # bridge and the Go reference can run in parallel; without this lock both
-    # processes compute `writes_remaining` against the same starting value and
-    # both proceed to write past the per-cycle cap.
-    lock_path = bp / "heartbeat" / ".osint_run_phase.lock"
-    _acquire_lock(lock_path, timeout_s=30)
-
     cache = load(bp)
     observations = cache["observations"]
 
-    raw_observations = _load_incoming(bp)
+    raw_observations_with_paths = _load_incoming(bp)
+    raw_observations = [raw for raw, _ in raw_observations_with_paths]
+    incoming_paths = [p for _, p in raw_observations_with_paths]
     new_ips = 0
     geo_drifts = 0
     signals_enqueued = 0
@@ -646,7 +656,14 @@ def run_phase(brain_path: str | Path) -> dict:
             signal = amended.pop("_signal", None)
 
             def _do_write() -> None:
-                """Write to /userdata if writes_remaining allows, else enqueue."""
+                """Write to /userdata if writes_remaining allows, else enqueue.
+
+                NOTE: binds `amended` from the enclosing for-loop via the
+                default-arg trick. Required because Python closures capture
+                variable names, not values — without this, any deferred call
+                (e.g. a future thread pool) would see the LAST iteration's
+                amended, not this one.
+                """
                 nonlocal userdata_writes, userdata_skipped, writes_remaining
                 if writes_remaining <= 0:
                     _enqueue_pending_userdata(bp, ip_hash, _to_ghost_signal(amended))
@@ -711,7 +728,15 @@ def run_phase(brain_path: str | Path) -> dict:
     finally:
         cache["observations"] = observations
         save(bp, cache)
-        _release_lock(lock_path)
+        # Delete incoming observation files only AFTER successful cache save.
+        # If crash occurs before this point, files remain and will be reprocessed
+        # next cycle (dedup handles duplicates).
+        for p in incoming_paths:
+            try:
+                p.unlink()
+            except OSError:
+                pass
+        _release_lock(lock)
 
     elapsed = (datetime.now(timezone.utc) - start).total_seconds() * 1000
 

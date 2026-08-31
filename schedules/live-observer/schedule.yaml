@@ -1,0 +1,6 @@
+schedule: every_5_minutes
+timeout_seconds: 60
+retry_on_failure: true
+max_retries: 1
+retry_backoff_seconds: 30
+run_on_startup: true

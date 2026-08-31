@@ -469,7 +469,7 @@ to `/Mouth` webhook for admin+developer roles.
 | File | Type | Status |
 |------|------|--------|
 | `tools/heart.py` | Python bridge | **Live** (15 phases, structlog, --once/--continuous/--dry-run) |
-| `tools/heartctl.py` | CLI control | **Live** (status/mode/repos/audit/health/phase/trigger/watch/doctor/env-check) |
+| `tools/heartctl.py` | CLI control | **Live** (status/mode/repos/audit/health/phase/trigger/watch/doctor/doctor-deep/env-check) |
 | `tools/requirements.txt` | Dependencies | **Live** (structlog>=24.1.0, PyYAML>=6.0) |
 | `tools/abuse_bridge.py` | Heart→doctor bridge | **Live** |
 | `tools/osint_cache.py` | OSINT cache | **Live** |
@@ -499,6 +499,8 @@ python Heart/tools/heart.py --once --brain-path Brain --dry-run
 python Heart/tools/heartctl.py --brain-path Brain status
 python Heart/tools/heartctl.py --brain-path Brain mode active
 python Heart/tools/heartctl.py --brain-path Brain doctor
+python Heart/tools/heartctl.py --brain-path Brain doctor-deep
+python Heart/tools/heartctl.py --brain-path Brain doctor-deep --fix-heartbeat
 
 # Go reference — one cycle, mode = active
 # In the unified Brain tree layout, both envs point into Brain/ (Go still
@@ -506,6 +508,24 @@ python Heart/tools/heartctl.py --brain-path Brain doctor
 # compose layout, BRAIN→/activememory/brain/, HEART→/activememory/heart/.
 HEART_BRAIN_PATH=Brain HEART_HEART_PATH=Brain/heartbeat go run ./Heart/cmd/heart
 ```
+
+## Heartbeat file contract
+
+The `/shared/.heartbeat` file is a sentinel marker that the Go sidecar (or any
+heartbeat-producing process) must maintain.  The file must contain exactly:
+
+```
+heartbeat: OK
+```
+
+(15 bytes, with a trailing newline: `b"heartbeat: OK\n"`).  Any other content
+— empty, whitespace-only, or different bytes — is treated as corruption by
+`heartctl doctor-deep` and reported as a drift.
+
+The file is also touched on every cycle to refresh mtime; the doctor
+distinguishes "stale mtime" (touch didn't happen, file is old) from "corrupt
+content" (mtime is fresh, content is wrong).  Both drift classes are reported
+separately.
 
 Note: `heart.py` uses a single `--brain-path` (not `--heart-path`).
 The Python bridge reads everything (entities, mode, repos.yaml, audit,

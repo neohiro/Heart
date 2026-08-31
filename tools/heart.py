@@ -33,15 +33,17 @@ Environment:
                        by (ip_hash, day) → write ghost profiles via
                        userdata.ghost_manager → emit worldmap.visitors.heatmap
                        datalayer. Privacy: SHA256(ip+ua), daily salt, no raw PII.
+    osint_userdata  — READ /userdata summaries → detect roles + resurrection events
     compute_health  — derive health metrics from all sources
     write_brain     — persist enriched entity state to Brain
     fire_reminders  — run due reminders from Brain/reminders/
     prune_stale     — reject stale datapoints
-    self_heal       — trigger doctor scripts if health degrades
+self_heal       — trigger doctor scripts if health degrades
     self_reflexive_check — scan own awareness, write findings, auto-correct
-                             (see Heart/SPEC_ADDENDUM.md)
+                                 (see Heart/SPEC_ADDENDUM.md)
     intuition_deliberate — weight findings, compute consensus, emit pokes
-                             and intuition.yaml (see Heart/SPEC_ADDENDUM.md)
+                                 and intuition.yaml (see Heart/SPEC_ADDENDUM.md)
+    grounding_audit — re-fetch + compare cached vs source (see GROUNDING.md §2)
     prune_shared    — shared storage: 85% auto-prune of transient files
     audit           — append phase results to Brain/audit/heartbeat.yaml
 
@@ -63,6 +65,7 @@ from pathlib import Path
 from typing import Any
 
 import structlog
+from atomic import write_text, write_yaml, write_yaml_multi_doc  # noqa: E402  (after _TOOLS_DIR path setup)
 
 # Ensure Heart/tools/ is on sys.path for sibling imports (e.g. abuse_bridge)
 _TOOLS_DIR = Path(__file__).resolve().parent
@@ -73,6 +76,8 @@ _WORKSPACE = _TOOLS_DIR.parent.parent
 for _p in (str(_WORKSPACE), str(_WORKSPACE / "userdata" / "src"), str(_WORKSPACE / "Brain" / "src")):
     if _p not in sys.path:
         sys.path.insert(0, _p)
+
+from Heart.tools import heart_shared_prune
 
 BRAIN_PATH = Path(os.environ.get("BRAIN_PATH", "/brain"))
 GH_TOKEN = os.environ.get("GH_TOKEN", "")
@@ -245,6 +250,39 @@ def _gh_api(path: str) -> dict[str, Any] | None:
         return None
 
 
+def _atomic_write_json(path: Path, data: dict) -> None:
+    """Write JSON atomically via the shared atomic module."""
+    if DRY_RUN:
+        log.debug("atomic_write_skipped_dry_run", path=str(path))
+        return
+    from atomic import write_json
+    write_json(path, data, prefix=".heartbeat.")
+
+
+def _atomic_write_yaml(path: Path, data: Any, *, multi_doc: bool = False) -> None:
+    """Write YAML atomically via the shared atomic module.
+
+    If multi_doc is True, each element of data is written as a separate YAML
+    document (separated by '---'), which is the format used by intuition.yaml,
+    self_heal.yaml, etc. Otherwise a single-document dump is written.
+    """
+    if DRY_RUN:
+        log.debug("atomic_write_skipped_dry_run", path=str(path))
+        return
+    if multi_doc:
+        write_yaml_multi_doc(path, data)
+    else:
+        write_yaml(path, data)
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    """Write plain text atomically via the shared atomic module."""
+    if DRY_RUN:
+        log.debug("atomic_write_skipped_dry_run", path=str(path))
+        return
+    write_text(path, text)
+
+
 def _write_audit(state: CycleState) -> None:
     if DRY_RUN:
         log.debug("write_audit_skipped_dry_run", phase_count=len(state.phases))
@@ -265,7 +303,9 @@ def _write_audit(state: CycleState) -> None:
         lines.append("")
     try:
         with open(audit_file, "a") as f:
-            f.write("\n".join(lines) + "\n")
+            f.write("\n" + "\n".join(lines) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
     except Exception as e:
         log.warning("audit_write_failed", error=str(e))
 
@@ -291,17 +331,23 @@ def _write_last_run(state: CycleState) -> None:
         f"phases:\n" + "\n".join(phase_yaml) + "\n"
     )
     try:
-        last_run.write_text(content, encoding="utf-8")
+        with open(last_run, "w", encoding="utf-8") as f:
+            f.write(content)
+            f.flush()
+            os.fsync(f.fileno())
     except Exception as e:
         log.warning("last_run_write_failed", error=str(e))
 
 
 def _enqueue_poke(state: CycleState, kind: str, payload: dict[str, Any]) -> None:
     """
-    Atomically enqueue a poke to Brain/heartbeat/poke_queue/<ts>_<kind>.json.
+    Atomically enqueue a poke to Brain/heartbeat/poke_queue/<ts>_<pid>_<mono_ns>_<kind>.json.
 
     Multiple pokes in the same cycle do NOT overwrite each other — each gets a unique
-    filename based on monotonic timestamp + a counter. Mouth/Doctor consumers can drain
+    filename based on ISO timestamp + PID + monotonic-nanosecond tick. PID prevents
+    collision after fork(); monotonic-ns guarantees uniqueness even at the same
+    millisecond. The kind is sanitized to [A-Za-z0-9_] so a caller-supplied kind
+    cannot escape queue_dir via `..` or `/`. Mouth/Doctor consumers can drain
     the queue in lexicographic order and delete processed pokes.
 
     Atomic write: tmp file in same dir → flush + fsync → os.replace. Cleans up tmp on error.
@@ -323,36 +369,13 @@ def _enqueue_poke(state: CycleState, kind: str, payload: dict[str, Any]) -> None
         # from escaping queue_dir.
         safe_kind = "".join(c if c.isalnum() or c == "_" else "_" for c in (kind or "unknown"))[:64]
         target = queue_dir / f"{ts_slug}_{pid_slug}_{mono_slug}_{safe_kind}.json"
-        import tempfile
-        tmp = None
-        try:
-            tmp = tempfile.NamedTemporaryFile(
-                "w", delete=False, dir=str(queue_dir), encoding="utf-8", suffix=".tmp"
-            )
-            tmp.write(json.dumps({
-                "ts": _iso_now(),
-                "kind": kind,
-                "cycle": state.cycle,
-                **payload,
-            }))
-            tmp.flush()
-            os.fsync(tmp.fileno())
-            tmp.close()
-            os.replace(tmp.name, str(target))
-            log.info("poke_enqueued", kind=kind, target=str(target))
-        except Exception:
-            if tmp is not None:
-                try:
-                    tmp.close()
-                except Exception:
-                    pass
-                _tmp_name = getattr(tmp, "name", None)
-                if _tmp_name and os.path.exists(_tmp_name):
-                    try:
-                        os.unlink(_tmp_name)
-                    except OSError:
-                        pass
-            raise
+        _atomic_write_json(target, {
+            "ts": _iso_now(),
+            "kind": kind,
+            "cycle": state.cycle,
+            **payload,
+        })
+        log.info("poke_enqueued", kind=kind, target=str(target))
     except OSError as e:
         log.warning("enqueue_poke_failed", kind=kind, error=str(e))
 
@@ -365,7 +388,10 @@ def _write_health(metrics: dict[str, Any]) -> None:
     health_file.parent.mkdir(parents=True, exist_ok=True)
     try:
         import yaml
-        health_file.write_text(yaml.dump(metrics, default_flow_style=False), encoding="utf-8")
+        with open(health_file, "w", encoding="utf-8") as f:
+            f.write(yaml.dump(metrics, default_flow_style=False))
+            f.flush()
+            os.fsync(f.fileno())
     except Exception as e:
         log.warning("health_write_failed", error=str(e))
 
@@ -609,20 +635,13 @@ def _phase_write_brain(state: CycleState) -> PhaseResult:
     t0 = time.monotonic()
     if not DRY_RUN:
         repo_summary = BRAIN_PATH / "heartbeat" / "repo_summary.json"
-        repo_summary.parent.mkdir(parents=True, exist_ok=True)
-        repo_summary.write_text(
-            json.dumps(
-                {
-                    "ts": _iso_now(),
-                    "cycle": state.cycle,
-                    "mode": state.mode,
-                    "repos": [{"org": r.org, "repo": r.repo, "entity": r.entity} for r in state.repos],
-                    "entities": state.entities_discovered,
-                },
-                indent=2,
-            ),
-            encoding="utf-8",
-        )
+        _atomic_write_json(repo_summary, {
+            "ts": _iso_now(),
+            "cycle": state.cycle,
+            "mode": state.mode,
+            "repos": [{"org": r.org, "repo": r.repo, "entity": r.entity} for r in state.repos],
+            "entities": state.entities_discovered,
+        })
     elapsed = int((time.monotonic() - t0) * 1000)
     log.info("phase_write_brain", repos=len(state.repos), entities=len(state.entities_discovered), dry_run=DRY_RUN)
     return PhaseResult(name="write_brain", ok=True, elapsed_ms=elapsed)
@@ -673,8 +692,7 @@ def _phase_prune_stale(state: CycleState) -> PhaseResult:
     error = ""
 
     try:
-        import osint_cache
-        pruned_total = osint_cache.prune_and_save(BRAIN_PATH)
+        pruned_total = heart_shared_prune.prune_and_save(BRAIN_PATH)
     except Exception as e:
         error = f"{type(e).__name__}: {e}"
         log.warning("phase_prune_stale_error", error=error)
@@ -751,27 +769,11 @@ def _phase_prune_stale(state: CycleState) -> PhaseResult:
                 else:
                     kept = fresh
                 if len(entries) > len(kept):
-                    import tempfile as _tempfile
-                    tmp = _tempfile.NamedTemporaryFile(
-                        "w", delete=False, dir=str(intuition_file.parent), encoding="utf-8", suffix=".tmp"
-                    )
-                    try:
-                        # Wrap each entry in a list so yaml.dump_all emits "---" + "- ts: ..." per doc.
-                        tmp.write(_yaml.dump_all(
-                            [[e] for e in kept],
-                            default_flow_style=False,
-                            sort_keys=False,
-                            allow_unicode=True,
-                        ))
-                        tmp.flush()
-                        os.fsync(tmp.fileno())
-                        tmp.close()
-                        os.replace(tmp.name, str(intuition_file))
-                        log.info("intuition_cap", original=len(entries), retained=len(kept))
-                    except Exception:
-                        if os.path.exists(tmp.name):
-                            os.unlink(tmp.name)
-                        raise
+                    # Wrap each entry in a list so yaml.dump_all emits "---" + "- ts: ..." per doc.
+                    # An empty kept list is valid: yaml.dump_all([]) writes an empty file,
+                    # correctly clearing all filtered entries.
+                    _atomic_write_yaml(intuition_file, [[e] for e in kept], multi_doc=True)
+                    log.info("intuition_cap", original=len(entries), retained=len(kept))
             except Exception as e:
                 log.warning("intuition_cap_failed", error=str(e))
     except ImportError:
@@ -806,9 +808,20 @@ def _phase_self_heal(state: CycleState) -> PhaseResult:
     actions: list[str] = []
     triggered = False
 
-    staleness_max = float(os.environ.get("HEART_HEAL_STALENESS_MAX", "0.6"))
-    error_rate_max = float(os.environ.get("HEART_HEAL_ERROR_RATE_MAX", "0.05"))
-    disk_free_min = int(os.environ.get("HEART_HEAL_DISK_FREE_MIN", "5242880"))
+    staleness_max = 0.6
+    error_rate_max = 0.05
+    try:
+        staleness_max = float(os.environ.get("HEART_HEAL_STALENESS_MAX", "0.6"))
+    except ValueError:
+        pass
+    try:
+        error_rate_max = float(os.environ.get("HEART_HEAL_ERROR_RATE_MAX", "0.05"))
+    except ValueError:
+        pass
+    try:
+        disk_free_min = int(os.environ.get("HEART_HEAL_DISK_FREE_MIN", "5242880"))
+    except ValueError:
+        disk_free_min = 5242880
 
     try:
         health_file = BRAIN_PATH / "heartbeat" / "health.yaml"
@@ -842,6 +855,7 @@ def _phase_self_heal(state: CycleState) -> PhaseResult:
             audit_file = BRAIN_PATH / "audit" / "self_heal.yaml"
             audit_file.parent.mkdir(parents=True, exist_ok=True)
             entry = (
+                f"\n"
                 f"- ts: {_iso_now()}\n"
                 f"  cycle: {state.cycle}\n"
                 f"  actions: {actions}\n"
@@ -947,15 +961,14 @@ def _phase_self_reflexive_check(state: CycleState) -> PhaseResult:
                         try:
                             org_path.parent.mkdir(parents=True, exist_ok=True)
                             safe_org = org.replace("'", "''")
-                            org_path.write_text(
+                            _atomic_write_text(org_path,
                                 f"# org-{safe_org} — auto-generated by Heart.self_reflexive_check\n\n"
                                 "> **Status: machine-generated skeleton.** Edit to add real content.\n\n"
                                 "## identity\n\n"
                                 "  - org: " + safe_org + "\n"
                                 "  - authority: unknown\n"
                                 "  - summary: TODO\n"
-                                "  - scope: TODO\n",
-                                encoding="utf-8",
+                                "  - scope: TODO\n"
                             )
                             log.info("reflexive_created_skeleton", target=str(org_path))
                         except OSError as e:
@@ -1055,7 +1068,7 @@ def _phase_self_reflexive_check(state: CycleState) -> PhaseResult:
                 lines.append(f"  message: {f['message']}")
                 lines.append("")
             with open(findings_file, "a", encoding="utf-8") as f:
-                f.write("\n".join(lines))
+                f.write("\n" + "\n".join(lines))
         except OSError as e:
             log.warning("reflexive_findings_write_failed", error=str(e))
 
@@ -1098,7 +1111,7 @@ def _phase_self_reflexive_check(state: CycleState) -> PhaseResult:
                 f"ts: {_iso_now()}\n"
                 f"seen_dirs:\n{seen_dirs_lines if seen_dirs_lines else '  []'}\n"
             )
-            baseline_file.write_text(content, encoding="utf-8")
+            _atomic_write_text(baseline_file, content)
         except OSError as e:
             log.warning("reflexive_baseline_write_failed", error=str(e))
 
@@ -1239,7 +1252,7 @@ def _phase_intuition_deliberate(state: CycleState) -> PhaseResult:
             intuition_file = BRAIN_PATH / "heartbeat" / "intuition.yaml"
             intuition_file.parent.mkdir(parents=True, exist_ok=True)
             entry = (
-                f"---\n"
+                f"\n---\n"
                 f"- ts: {_iso_now()}\n"
                 f"  cycle: {state.cycle}\n"
                 f"  mode: {state.mode}\n"
@@ -1253,6 +1266,8 @@ def _phase_intuition_deliberate(state: CycleState) -> PhaseResult:
             )
             with open(intuition_file, "a", encoding="utf-8") as f:
                 f.write(entry)
+                f.flush()
+                os.fsync(f.fileno())
         except OSError as e:
             log.warning("intuition_write_failed", error=str(e))
 
@@ -1319,7 +1334,7 @@ def _phase_intuition_deliberate(state: CycleState) -> PhaseResult:
             existing["escalated"] = merged
             existing["ts"] = existing_ts
             existing["last_intuition_cycle"] = state.cycle
-            ab.write_text(json.dumps(existing, indent=2), encoding="utf-8")
+            _atomic_write_json(ab, existing)
         except OSError as e:
             log.warning("intuition_admin_briefing_write_failed", error=str(e))
 
@@ -1386,10 +1401,9 @@ def _phase_prune_shared(state: CycleState) -> PhaseResult:
         total = usage.total
         usage_pct = (bytes_used / total * 100) if total > 0 else 0.0
 
-        if usage_pct >= prune_threshold_pct and prune_enabled:
+        if usage_pct >= prune_threshold_pct and prune_enabled and not DRY_RUN:
             triggered = True
-            import osint_cache
-            files_pruned, bytes_pruned = osint_cache.prune_largest_first(
+            files_pruned, bytes_pruned = heart_shared_prune.prune_largest_first(
                 safe_subtrees, prune_budget_bytes
             )
     except Exception as e:
@@ -1401,7 +1415,7 @@ def _phase_prune_shared(state: CycleState) -> PhaseResult:
             audit_file = BRAIN_PATH / "audit" / "shared_prune.yaml"
             audit_file.parent.mkdir(parents=True, exist_ok=True)
             entry = (
-                f"- ts: {_iso_now()}\n"
+                f"\n- ts: {_iso_now()}\n"
                 f"  cycle: {state.cycle}\n"
                 f"  usage_pct: {usage_pct:.1f}\n"
                 f"  files_pruned: {files_pruned}\n"
@@ -1429,6 +1443,54 @@ def _phase_prune_shared(state: CycleState) -> PhaseResult:
         elapsed_ms=elapsed,
         error=error,
     )
+
+
+def _phase_grounding_audit(state: CycleState) -> PhaseResult:
+    """
+    Phase 17 — grounding_audit (per GROUNDING.md § 2).
+
+    Sample N (entity, datapoint) pairs from /shared/brain/knowledge/sources.yaml,
+    re-fetch from source, compare against cached values, write one JSONL line
+    to /shared/brain/audit/grounding.jsonl, and update
+    /shared/public/health/grounding.json.
+
+    Emits a poke when aggregate grounding_rate < 0.90 for two consecutive cycles.
+
+    Cadence: every cycle in `active`/`sports` modes, every 6th cycle in `normal`
+    mode, every 60th cycle in `dormant` mode (controlled via
+    HEART_GROUNDING_EVERY_N env var, default = mode-aware).
+    """
+    t0 = time.monotonic()
+    error = ""
+
+    # Cadence gate
+    try:
+        every_n_env = os.environ.get("HEART_GROUNDING_EVERY_N", "")
+        if every_n_env:
+            every_n = max(1, int(every_n_env))
+        else:
+            mode = state.mode
+            every_n = {"dormant": 60, "normal": 6, "active": 1, "sports": 1, "turbo": 1}.get(mode, 6)
+    except ValueError:
+        every_n = 6
+
+    if state.cycle % every_n != 0:
+        elapsed = int((time.monotonic() - t0) * 1000)
+        return PhaseResult(name="grounding_audit", ok=True, elapsed_ms=elapsed, repos_touched=0)
+
+    try:
+        # Lazy import; the script lives in Heart/tools/ next to heart.py
+        from Heart.tools import grounding as grounding_mod
+        rc = grounding_mod.main()
+        if rc not in (0, 1):  # 1 = "no sources"; treat as warning not error
+            error = f"grounding.py exit={rc}"
+    except Exception as e:
+        error = f"{type(e).__name__}: {e}"
+        log.warning("phase_grounding_audit_error", error=error)
+
+    elapsed = int((time.monotonic() - t0) * 1000)
+    log.info("phase_grounding_audit", every_n=every_n, elapsed_ms=elapsed)
+    return PhaseResult(name="grounding_audit", ok=not error, elapsed_ms=elapsed, error=error)
 
 
 def _phase_audit(state: CycleState) -> PhaseResult:
@@ -1464,6 +1526,7 @@ def run_cycle(state: CycleState) -> CycleState:
         ("self_heal", _phase_self_heal),
         ("self_reflexive_check", _phase_self_reflexive_check),  # scan own awareness; auto-correct
         ("intuition_deliberate", _phase_intuition_deliberate),  # weight findings; consensus; pokes
+        ("grounding_audit", _phase_grounding_audit),  # GROUNDING.md §2: re-fetch + compare cached vs source
         ("prune_shared", _phase_prune_shared),  # shared storage: 85% auto-prune
         ("audit", _phase_audit),
     ]
@@ -1505,6 +1568,8 @@ def main() -> None:
     BRAIN_PATH = Path(args.brain_path)
     LOG_LEVEL = args.log_level
     DRY_RUN = args.dry_run
+    if DRY_RUN:
+        os.environ["HEART_DRY_RUN"] = "1"
 
     structlog.configure(
         wrapper_class=structlog.make_filtering_bound_logger(
