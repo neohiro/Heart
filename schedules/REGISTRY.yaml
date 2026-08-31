@@ -203,7 +203,7 @@ scopes:
     status: implemented   # 2026-08-31
 
   - id: live-observer
-    description: "BRAIN_LIVE_OBSERVER.md: managed daemon that watches all org repos (discovered from Brain/_entities/org-*.md) and emits per-file change records to /shared/brain/watch/changes/. Daemon mode is restart-only; SIGTERM drains timers and removes the sentinel."
+    description: "BRAIN_LIVE_OBSERVER.md: scheduled run of live_observer_runner.py in --once mode (per-org initial scan + delta emit, then exit). Heart restarts the subprocess every 5 min so SIGTERM is not used in production; the SIGTERM path is exercised by tests and is the safety net for ad-hoc daemon mode."
     path: Heart/tools/live_observer_runner.py
     schedule: every_5_minutes
     timeout_seconds: 60
