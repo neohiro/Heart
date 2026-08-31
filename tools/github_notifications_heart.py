@@ -213,8 +213,14 @@ def _should_headline(event: dict) -> bool:
     et = str(event.get("event_type", ""))
     action = str(event.get("action", "") or "").lower()
     severity = str(event.get("severity", "info"))
+    subject_state = str((event.get("subject") or {}).get("state", "")).lower()
     if et == "pull_request":
-        return action == "merged"
+        # A PR is "merged" if either the action verb is "merged" or
+        # the subject state was normalised to "merged" (which happens
+        # when the upstream sends action="closed" with merged=True).
+        if action == "merged" or subject_state == "merged":
+            return True
+        return False
     if et == "issues":
         if action != "opened":
             return False
