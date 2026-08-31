@@ -259,37 +259,32 @@ class TestDeadOnArrivalObserver(unittest.TestCase):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def test_dead_on_arrival_observer_skips_sentinel(self):
-        """If the observer process exits before the sentinel is written, no sentinel is created."""
+        """If the observer exits before the sentinel is written, no sentinel is created."""
+        import unittest.mock
+
         mod = _load()
         mod.WATCH_DIR = self.tmp
         mod.SENTINEL_PATH = self.tmp / "observer.sentinel.json"
 
-        # A subprocess that exits immediately with code 0, simulating a
-        # dead-on-arrival observer.
-        proc = subprocess.Popen(
+        # Patch _launch_observer to return a proc that has already exited (DOA).
+        # main() will then call poll(), see the process is dead, and skip the
+        # sentinel write. This exercises the full main() code path.
+        dead_proc = subprocess.Popen(
             [sys.executable, "-c", "import sys; sys.exit(0)"],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
         )
-        # Wait for the process to actually exit before the test asserts the
-        # poll() branch is taken.
-        proc.wait()
+        dead_proc.wait()
 
-        # Inline the race-detection logic from main() — if poll() is not None
-        # immediately, the runner should skip the sentinel write and report
-        # the exit code. We replicate that branch here to test it directly
-        # without subprocess the real observer module.
-        global _observer_proc
-        _observer_proc = proc
-        try:
-            if proc.poll() is not None:
-                rc = proc.returncode
-                self.assertEqual(rc, 0)
-                # Branch: do NOT write sentinel.
-                self.assertFalse(mod.SENTINEL_PATH.exists(),
-                                 "sentinel must not be written for a dead-on-arrival observer")
-        finally:
-            _observer_proc = None
+        with unittest.mock.patch.object(mod, "_launch_observer", return_value=dead_proc):
+            rc = mod.main(argv=["--roots", "neohiro-LLM:/repos/LLM"])
+
+        self.assertIn(rc, (1, 2),
+                      f"DOA observer should return non-zero, got {rc}")
+        self.assertFalse(mod.SENTINEL_PATH.exists(),
+                        "sentinel must not be written for a dead-on-arrival observer")
+        self.assertFalse(mod.SENTINEL_PATH.with_suffix(".tmp").exists(),
+                        "no temp files should be left behind")
 
 
 if __name__ == "__main__":
