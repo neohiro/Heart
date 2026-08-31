@@ -5,6 +5,7 @@ test_grounding.py — unit tests for Heart/tools/grounding.py
 
 from __future__ import annotations
 
+import contextlib
 import importlib.util
 import json
 import os
@@ -121,6 +122,34 @@ sources:
         result = self._invoke_main(['--dry-run'])
         self.assertEqual(result, 0)
         self.assertFalse(audit_path.exists(), 'dry-run should not write audit log')
+
+    def test_dry_run_with_report_json(self):
+        """--dry-run --report-json emits a single-line JSON plan on stdout."""
+        from io import StringIO
+        audit_path = self.mod._audit_path()
+        if audit_path.exists():
+            audit_path.unlink()
+        buf = StringIO()
+        with contextlib.redirect_stdout(buf):
+            result = self._invoke_main(['--dry-run', '--report-json'])
+        self.assertEqual(result, 0)
+        # Find the JSON report line (skip human-readable progress lines)
+        report = None
+        for line in buf.getvalue().splitlines():
+            line = line.strip()
+            if not line.startswith('{'):
+                continue
+            try:
+                report = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+        self.assertIsNotNone(report, f'no JSON report in output: {buf.getvalue()!r}')
+        self.assertEqual(report['mode'], 'dry_run')
+        self.assertGreater(report['sample_size'], 0)
+        self.assertIsNone(report['grounding_rate'])
+        self.assertIsNone(report['band'])
+        self.assertIsNotNone(report['previous_rate'])  # we wrote the sidecar above
+        self.assertIsInstance(report['samples'], list)
 
     def test_write_health(self):
         samples = [

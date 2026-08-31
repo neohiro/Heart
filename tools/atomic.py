@@ -177,6 +177,12 @@ def write_yaml_multi_doc(path: Path, docs: list[Any], *, prefix: str = "") -> No
         TypeError: if PyYAML is not installed
         OSError:  if the temp file cannot be created, written, or renamed;
                   the target is untouched on any failure.
+
+    Note:
+        An empty ``docs`` list is valid and writes a 0-byte file (equivalent
+        to clearing all entries, e.g. when the intuition cap filters
+        everything). This is intentional; callers that want to skip the write
+        when docs is empty must do so themselves.
     """
     if not _HAS_YAML:
         raise TypeError("PyYAML is required for write_yaml_multi_doc; pip install pyyaml")
@@ -384,7 +390,23 @@ class FileLock:
             return True
 
         deadline = time.monotonic() + timeout_s
-        self._fd = os.open(self._path, os.O_RDWR | os.O_CREAT, 0o644)
+        while True:
+            try:
+                if self._path.is_dir():
+                    try:
+                        self._path.rmdir()
+                    except OSError:
+                        pass
+                self._fd = os.open(self._path, os.O_RDWR | os.O_CREAT, 0o644)
+                break
+            except PermissionError:
+                if not self._path.is_dir():
+                    raise
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        f"Could not acquire lock {self._path} within {timeout_s}s"
+                    ) from None
+                time.sleep(0.05)
 
         while True:
             try:

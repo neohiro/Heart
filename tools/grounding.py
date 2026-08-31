@@ -356,6 +356,9 @@ def main() -> int:
     parser.add_argument('--once', action='store_true', help='run once and exit (default)')
     parser.add_argument('--dry-run', action='store_true', help='print plan but do not fetch or write')
     parser.add_argument('--seed', type=int, default=None, help='seed for deterministic sampling')
+    parser.add_argument('--report-json', action='store_true',
+                        help='emit a single-line JSON report on stdout at the end '
+                             '(parseable by Prometheus exporters / CI step summaries)')
     args = parser.parse_args()
 
     n = max(MIN_SAMPLE, args.sample_size)
@@ -379,6 +382,23 @@ def main() -> int:
         print(f'grounding: dry run, {len(pairs)} samples planned across {scope_count} sources')
         for s, v in pairs:
             print(f'  - {s.get("id")} / {v}')
+        if args.report_json:
+            plan_report = {
+                'ts': _iso_now(),
+                'mode': 'dry_run',
+                'sample_size': len(pairs),
+                'scope_count': scope_count,
+                'grounding_rate': None,
+                'band': None,
+                'matched': None,
+                'total': None,
+                'previous_rate': _read_last_cycle_rate()[0],
+                'samples': [
+                    {'scope': s.get('id'), 'variable': v, 'matched': None, 'cached_value': None, 'fetched_value': None, 'latency_ms': 0}
+                    for s, v in pairs
+                ],
+            }
+            print(json.dumps(plan_report))
         return 0
 
     print(f'grounding: sampling {len(pairs)} pairs across {scope_count} sources')
@@ -467,6 +487,25 @@ def main() -> int:
     if rate < 0.95:
         # Increment intuition weight would go here in production
         print('grounding: intuition weight increment for under-95% scopes')
+
+    if args.report_json:
+        report = {
+            'ts': aggregate_entry['ts'],
+            'mode': 'live',
+            'grounding_rate': rate,
+            'band': band,
+            'matched': matched,
+            'total': total,
+            'scope_count': scope_count,
+            'previous_rate': last_rate,
+            'mismatched_scopes': [
+                {'scope': s['scope'], 'variable': s['variable'],
+                 'cached_value': s.get('cached_value'), 'fetched_value': s.get('fetched_value'),
+                 'latency_ms': s.get('latency_ms', 0)}
+                for s in samples if not s.get('matched')
+            ],
+        }
+        print(json.dumps(report))
 
     return 0
 

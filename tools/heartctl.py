@@ -175,55 +175,63 @@ def cmd_phase(args: argparse.Namespace) -> int:
 
     # Honour --dry-run: gate both the module-level DRY_RUN flag (used by
     # heart.py writers) AND the HEART_DRY_RUN env var (consumed by
-    # heart_shared_prune._is_dry_run). Both must be set for the dry-run
-    # contract to hold end-to-end.
+    # heart_shared_prune._is_dry_run). Both are set here.
+    #
+    # The module flag is restored to its prior value before returning so
+    # subsequent phases in the same process aren't accidentally dry-run.
+    # The env var is intentionally NOT restored — _is_dry_run reads the
+    # module flag first (authoritative), so a stale env var after a
+    # non-dry-run call is harmless. See heart_shared_prune._is_dry_run.
+    previous_dry_run = _heart_module.DRY_RUN
     if getattr(args, "dry_run", False):
         _heart_module.DRY_RUN = True
         os.environ["HEART_DRY_RUN"] = "1"
-
-    state = _heart_module.CycleState()
-    state.repos = _heart_module._discover_orgs_from_entities()
-    state.repos.extend(_heart_module._load_repos_yaml())
-
-    phase_map = {
-        "discover_repos": _heart_module._phase_discover_repos,
-        "fetch_repos": _heart_module._phase_fetch_repos,
-        "fetch_issues": _heart_module._phase_fetch_issues,
-        "fetch_prs": _heart_module._phase_fetch_prs,
-        "fetch_actions": _heart_module._phase_fetch_actions,
-        "ingest_news": _heart_module._phase_ingest_news,
-        "ingest_content": _heart_module._phase_ingest_content,
-        "ingest_osint": _heart_module._phase_ingest_osint,
-        "osint_userdata": _heart_module._phase_osint_userdata,
-        "compute_health": _heart_module._phase_compute_health,
-        "write_brain": _heart_module._phase_write_brain,
-        "fire_reminders": _heart_module._phase_fire_reminders,
-        "prune_stale": _heart_module._phase_prune_stale,
-        "self_heal": _heart_module._phase_self_heal,
-        "self_reflexive_check": _heart_module._phase_self_reflexive_check,
-        "intuition_deliberate": _heart_module._phase_intuition_deliberate,
-        "grounding_audit": _heart_module._phase_grounding_audit,
-        "prune_shared": _heart_module._phase_prune_shared,
-        "audit": _heart_module._phase_audit,
-    }
-
-    if args.phase_name not in phase_map:
-        print(f"unknown phase: {args.phase_name}")
-        print(f"available: {', '.join(sorted(phase_map.keys()))}")
-        return 1
     try:
-        result = phase_map[args.phase_name](state)
-        print(json.dumps(
-            {"phase": result.name, "ok": result.ok, "elapsed_ms": result.elapsed_ms,
-             "error": result.error, "repos_touched": result.repos_touched},
-            indent=2))
-    except Exception as e:
-        print(json.dumps(
-            {"phase": args.phase_name, "ok": False,
-             "error": f"{type(e).__name__}: {e}",
-             "traceback": traceback.format_exc()}))
-        return 1
-    return 0
+        state = _heart_module.CycleState()
+        state.repos = _heart_module._discover_orgs_from_entities()
+        state.repos.extend(_heart_module._load_repos_yaml())
+
+        phase_map = {
+            "discover_repos": _heart_module._phase_discover_repos,
+            "fetch_repos": _heart_module._phase_fetch_repos,
+            "fetch_issues": _heart_module._phase_fetch_issues,
+            "fetch_prs": _heart_module._phase_fetch_prs,
+            "fetch_actions": _heart_module._phase_fetch_actions,
+            "ingest_news": _heart_module._phase_ingest_news,
+            "ingest_content": _heart_module._phase_ingest_content,
+            "ingest_osint": _heart_module._phase_ingest_osint,
+            "osint_userdata": _heart_module._phase_osint_userdata,
+            "compute_health": _heart_module._phase_compute_health,
+            "write_brain": _heart_module._phase_write_brain,
+            "fire_reminders": _heart_module._phase_fire_reminders,
+            "prune_stale": _heart_module._phase_prune_stale,
+            "self_heal": _heart_module._phase_self_heal,
+            "self_reflexive_check": _heart_module._phase_self_reflexive_check,
+            "intuition_deliberate": _heart_module._phase_intuition_deliberate,
+            "grounding_audit": _heart_module._phase_grounding_audit,
+            "prune_shared": _heart_module._phase_prune_shared,
+            "audit": _heart_module._phase_audit,
+        }
+
+        if args.phase_name not in phase_map:
+            print(f"unknown phase: {args.phase_name}")
+            print(f"available: {', '.join(sorted(phase_map.keys()))}")
+            return 1
+        try:
+            result = phase_map[args.phase_name](state)
+            print(json.dumps(
+                {"phase": result.name, "ok": result.ok, "elapsed_ms": result.elapsed_ms,
+                 "error": result.error, "repos_touched": result.repos_touched},
+                indent=2))
+        except Exception as e:
+            print(json.dumps(
+                {"phase": args.phase_name, "ok": False,
+                 "error": f"{type(e).__name__}: {e}",
+                 "traceback": traceback.format_exc()}))
+            return 1
+        return 0
+    finally:
+        _heart_module.DRY_RUN = previous_dry_run
 
 
 def cmd_trigger(args: argparse.Namespace) -> int:

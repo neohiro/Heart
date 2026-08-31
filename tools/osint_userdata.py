@@ -445,7 +445,4 @@ if __name__ == "__main__":
     parser.add_argument("--json", action="store_true", help="emit JSON only")
     args = parser.parse_args()
     result = run_phase(args.brain_path)
-    if args.json:
-        print(json.dumps(result, indent=2))
-    else:
-        print(json.dumps(result, indent=2))
+    print(json.dumps(result, indent=2))

@@ -455,8 +455,9 @@ def run_once(brain_path: Optional[Path] = None) -> dict[str, Any]:
             continue
 
         # Respect the batch limit so a large backlog doesn't lock the dispatcher.
+        # (The first pass already computed `skipped_over_limit = total_unprocessed - batch_limit`
+        #  so the remaining files are skipped without double-counting here.)
         if processed_this_run >= batch_limit:
-            skipped_over_limit += 1
             continue
 
         feedback = _read_feedback(fb_path)
@@ -560,6 +561,7 @@ def run_once(brain_path: Optional[Path] = None) -> dict[str, Any]:
         "ok": ok,
         "processed": processed_count,
         "errors": error_count,
+        "skipped_over_batch_limit": skipped_over_limit,
         "results": [r.__dict__ for r in results],
         "ts": _iso_now(),
     }

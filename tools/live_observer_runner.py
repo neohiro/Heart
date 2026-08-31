@@ -167,7 +167,7 @@ def main() -> int:
             if not entry or ":" not in entry:
                 continue
             scope, path = entry.split(":", 1)
-            if not re.match(r"^[A-Za-z0-9_/-]{1,128}$", scope):
+            if not re.match(r"^[A-Za-z0-9_-]{1,64}$", scope):
                 print(f"[live_observer_runner] invalid scope {scope!r}, skipping", file=sys.stderr)
                 continue
             roots[scope] = Path(path).resolve()
@@ -207,10 +207,6 @@ def main() -> int:
         print(f"  {scope} → {root}")
 
     try:
-        rc = proc.wait()
-    except KeyboardInterrupt:
-        print("[live_observer_runner] interrupted")
-        proc.terminate()
         rc = proc.wait()
     finally:
         _sentinel_remove()

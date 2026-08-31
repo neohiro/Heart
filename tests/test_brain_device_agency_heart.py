@@ -152,14 +152,14 @@ class TestRunIntrospective:
     def test_grounding_rate_low_adds_gap(self, tmp_path, monkeypatch):
         brain = tmp_path / "brain"
         brain.mkdir(parents=True)
-        # The introspective phase looks at BRAIN_PATH.parent/public/health/grounding.json
-        # (consistent with _phase_prune_shared using root = BRAIN_PATH.parent).
-        parent = tmp_path
-        public = parent / "public" / "health"
+        # The introspective phase now reads from NEOHIRO_SHARED_ROOT
+        # (same convention as Heart/tools/grounding.py).
+        public = tmp_path / "public" / "health"
         public.mkdir(parents=True)
         (public / "grounding.json").write_text(
             json.dumps({"grounding_rate": 0.80}), encoding="utf-8")
         monkeypatch.setenv("BRAIN_PATH", str(brain))
+        monkeypatch.setenv("NEOHIRO_SHARED_ROOT", str(tmp_path))
         intro = bda_h._run_introspective()
         assert intro["self_aware"] is False
         assert any("0.80" in g for g in intro["awareness_gaps"])
@@ -357,3 +357,48 @@ class TestRunOnce:
         result = bda_h.run_once()
         assert result["ok"] is True
         assert result["processed"] == 0
+
+    def test_batch_limit_respects_env_var(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HEART_BRAIN_DEVICE_RETRO_BATCH", "2")
+        monkeypatch.setenv("NEOHIRO_BRAIN_DEVICE_FEEDBACK_DIR", str(tmp_path / "feedback"))
+        feedback_dir = tmp_path / "feedback"
+        feedback_dir.mkdir(parents=True)
+        # Wipe any leftover files so this test has a clean slate.
+        for f in feedback_dir.glob("*.yaml"):
+            f.unlink()
+        for f in feedback_dir.glob(".processed"):
+            f.unlink()
+        # Write 5 unprocessed feedback files
+        for i in range(5):
+            write_feedback(feedback_dir, "dev", f"user{i}", "linux_exec", {"exit_code": 0})
+
+        result = bda_h.run_once()
+
+        # Only 2 should be processed; 3 should be skipped due to batch limit.
+        assert result["processed"] == 2
+        assert result["skipped_over_batch_limit"] == 3
+
+    def test_batch_limit_default_50(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("NEOHIRO_BRAIN_DEVICE_FEEDBACK_DIR", str(tmp_path / "feedback"))
+        feedback_dir = tmp_path / "feedback"
+        feedback_dir.mkdir(parents=True)
+        for f in list(feedback_dir.glob("*.yaml")) + list(feedback_dir.glob(".processed")):
+            f.unlink()
+        # Write 60 unprocessed feedback files (over default batch of 50).
+        for i in range(60):
+            write_feedback(feedback_dir, "dev", f"user{i}", "linux_exec", {"exit_code": 0})
+
+        result = bda_h.run_once()
+
+        assert result["processed"] == 50
+        assert result["skipped_over_batch_limit"] == 10
+
+    def test_invalid_batch_env_falls_back_to_50(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HEART_BRAIN_DEVICE_RETRO_BATCH", "not_a_number")
+        monkeypatch.setenv("NEOHIRO_BRAIN_DEVICE_FEEDBACK_DIR", str(tmp_path / "feedback"))
+        feedback_dir = tmp_path / "feedback"
+        feedback_dir.mkdir(parents=True)
+        write_feedback(feedback_dir, "dev", "alice", "linux_exec", {"exit_code": 0})
+
+        result = bda_h.run_once()
+        assert result["processed"] == 1

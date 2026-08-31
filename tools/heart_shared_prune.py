@@ -30,10 +30,11 @@ def _is_dry_run(brain_path: str | Path) -> bool:
          test can disable disk writes without setting env vars)
     """
     try:
-        from Heart.tools.heart import DRY_RUN as _heart_dry_run
+        import Heart.tools.heart as _heart_mod
+        _heart_dry_run = getattr(_heart_mod, "DRY_RUN", False)
         if _heart_dry_run:
             return True
-    except (ImportError, AttributeError):
+    except ImportError:
         pass
     if os.environ.get("HEART_DRY_RUN", "") not in ("", "0"):
         return True
