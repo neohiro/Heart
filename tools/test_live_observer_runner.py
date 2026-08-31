@@ -9,6 +9,7 @@ import importlib.util
 import json
 import os
 import shutil
+import signal
 import sys
 import tempfile
 import unittest
@@ -27,11 +28,9 @@ def _load(name: str | None = None) -> object:
     mod_name = name or f"live_observer_runner_{_load_count}"
     spec = importlib.util.spec_from_file_location(mod_name, str(TOOL_PATH))
     mod = importlib.util.module_from_spec(spec)
-    # Add Heart/tools to sys.path so the module can resolve `from atomic import ...`
-    # when its own code does the deferred import.
-    tools_dir = str(TOOL_PATH.parent)
-    if tools_dir not in sys.path:
-        sys.path.insert(0, tools_dir)
+    for _p in (str(TOOL_PATH.parent), str(ROOT / "Brain" / "src")):
+        if _p not in sys.path:
+            sys.path.insert(0, _p)
     spec.loader.exec_module(mod)
     return mod
 
@@ -158,6 +157,55 @@ class TestSentinelWrite(unittest.TestCase):
         mod.SENTINEL_PATH.write_text("{}", encoding="utf-8")
         mod._sentinel_remove()
         self.assertFalse(mod.SENTINEL_PATH.exists())
+
+
+class TestSigtermDrain(unittest.TestCase):
+    """Tests for SIGTERM handler cleanup and sentinel lifecycle."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="liverunner-sigterm-"))
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_sigterm_removes_sentinel_and_no_temp_files(self):
+        """SIGTERM handler removes sentinel and leaves no temp files."""
+        mod = _load()
+        mod.WATCH_DIR = self.tmp
+        mod.SENTINEL_PATH = self.tmp / "observer.sentinel.json"
+        mod._sentinel_write(12345, {"neohiro-LLM": "/repos/LLM"}, ok=True)
+
+        self.assertTrue(mod.SENTINEL_PATH.exists())
+
+        mod._sigterm_handler(signal.SIGTERM, None)
+
+        self.assertFalse(mod.SENTINEL_PATH.exists())
+        self.assertFalse(mod.SENTINEL_PATH.with_suffix(".tmp").exists())
+
+        remaining = list(self.tmp.iterdir())
+        self.assertEqual(remaining, [])
+
+    def test_sigterm_idempotent_when_no_sentinel(self):
+        """_sigterm_handler is safe to call even if sentinel does not exist."""
+        mod = _load()
+        mod.WATCH_DIR = self.tmp
+        mod.SENTINEL_PATH = self.tmp / "observer.sentinel.json"
+
+        mod._sigterm_handler(signal.SIGTERM, None)
+
+        remaining = list(self.tmp.iterdir())
+        self.assertEqual(remaining, [])
+
+    def test_running_flag_cleared_on_sigterm(self):
+        """SIGTERM sets _running to False so the watch loop exits."""
+        mod = _load()
+        mod.WATCH_DIR = self.tmp
+        mod.SENTINEL_PATH = self.tmp / "observer.sentinel.json"
+        mod._running = True
+
+        mod._sigterm_handler(signal.SIGTERM, None)
+
+        self.assertFalse(mod._running)
 
 
 if __name__ == "__main__":
