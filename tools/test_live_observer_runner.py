@@ -180,7 +180,12 @@ class TestSigtermDrain(unittest.TestCase):
         mod._sigterm_handler(signal.SIGTERM, None)
 
         self.assertFalse(mod.SENTINEL_PATH.exists())
-        self.assertFalse(mod.SENTINEL_PATH.with_suffix(".tmp").exists())
+        # mkstemp uses a random suffix (e.g. ".atomic.XXXXXX.tmp") so we glob
+        # the directory for any leftover temp files instead of checking a
+        # specific name.
+        leftover_tmps = list(self.tmp.glob("*.tmp"))
+        self.assertEqual(leftover_tmps, [],
+                         f"SIGTERM leaked temp files: {leftover_tmps}")
 
         remaining = list(self.tmp.iterdir())
         self.assertEqual(remaining, [])
