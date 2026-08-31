@@ -74,9 +74,9 @@ repos: {json.dumps(repos)}
         mod = _load()
         roots = mod._discover_orgs()
         scopes = sorted(roots.keys())
-        self.assertEqual(scopes, ["neohiro/Heart", "neohiro/LLM"])
-        self.assertEqual(roots["neohiro/LLM"].name, "LLM")
-        self.assertEqual(roots["neohiro/Heart"].name, "Heart")
+        self.assertEqual(scopes, ["neohiro-Heart", "neohiro-LLM"])
+        self.assertEqual(roots["neohiro-LLM"].name, "LLM")
+        self.assertEqual(roots["neohiro-Heart"].name, "Heart")
 
     def test_discovers_multiple_org_entities(self):
         self._write_entity("org-fpm", "frenzypenguin", ["website", "docs"])
@@ -87,14 +87,14 @@ repos: {json.dumps(repos)}
         mod = _load()
         roots = mod._discover_orgs()
         scopes = sorted(roots.keys())
-        self.assertEqual(scopes, ["frenzypenguin/docs", "frenzypenguin/website", "openstageisland/api"])
+        self.assertEqual(scopes, ["frenzypenguin-docs", "frenzypenguin-website", "openstageisland-api"])
 
     def test_skips_missing_local_repos(self):
         self._write_entity("org-neohiro", "neohiro", ["LLM", "GhostRepo"])
         self._mk_repo(self._root / "LLM")
         mod = _load()
         roots = mod._discover_orgs()
-        self.assertEqual(list(roots.keys()), ["neohiro/LLM"])
+        self.assertEqual(list(roots.keys()), ["neohiro-LLM"])
 
     def test_empty_ents_dir(self):
         mod = _load()
@@ -112,18 +112,18 @@ repos: {json.dumps(repos)}
 class TestBuildRootsArg(unittest.TestCase):
     def test_single_root(self):
         mod = _load()
-        arg = mod._build_roots_arg({"neohiro/LLM": Path("/repos/LLM")})
-        self.assertEqual(arg, f"neohiro/LLM:{Path('/repos/LLM')}")
+        arg = mod._build_roots_arg({"neohiro-LLM": Path("/repos/LLM")})
+        self.assertEqual(arg, f"neohiro-LLM:{Path('/repos/LLM')}")
 
     def test_multiple_sorted(self):
         mod = _load()
         arg = mod._build_roots_arg({
-            "neohiro/LLM": Path("/a/LLM"),
-            "neohiro/Heart": Path("/a/Heart"),
+            "neohiro-LLM": Path("/a/LLM"),
+            "neohiro-Heart": Path("/a/Heart"),
         })
         expected = ",".join([
-            f"neohiro/Heart:{Path('/a/Heart')}",
-            f"neohiro/LLM:{Path('/a/LLM')}",
+            f"neohiro-Heart:{Path('/a/Heart')}",
+            f"neohiro-LLM:{Path('/a/LLM')}",
         ])
         self.assertEqual(arg, expected)
 
@@ -148,7 +148,7 @@ class TestSentinelWrite(unittest.TestCase):
         data = json.loads(mod.SENTINEL_PATH.read_text(encoding="utf-8"))
         self.assertEqual(data["pid"], 12345)
         self.assertEqual(data["ok"], True)
-        self.assertEqual(data["roots"], {"neohiro/LLM": "/repos/LLM"})
+        self.assertEqual(data["roots"], {"neohiro-LLM": "/repos/LLM"})
         self.assertIn("started_at", data)
 
     def test_sentinel_remove(self):

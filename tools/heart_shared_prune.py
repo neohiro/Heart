@@ -23,11 +23,11 @@ def _is_dry_run(brain_path: str | Path) -> bool:
     """True when the caller has signalled dry-run mode.
 
     Three signals, checked in order:
-      1. heart.DRY_RUN module flag (kept in sync with heartctl.cmd_phase even
-         after the env var is restored to its prior value)
+      1. heart.DRY_RUN module flag (authoritative; cmd_phase restores it after
+         each call so a stale env var is harmless)
       2. HEART_DRY_RUN env var (for standalone callers and test setup)
-      3. heartbeat/.dry_run sentinel file (so a kill-switch or sandboxed
-         test can disable disk writes without setting env vars)
+      3. heartbeat/.dry_run sentinel file (kill-switch or sandboxed test
+         without env vars)
     """
     try:
         import Heart.tools.heart as _heart_mod
@@ -74,9 +74,9 @@ def _collect_files(root: Path) -> list[tuple[int, Path]]:
 
 def _collect_files_under(root: Path, root_resolved: Path) -> list[tuple[int, Path]]:
     """Inner recursion: root is already resolved to root_resolved, so each
-    entry is checked against the resolved root without re-resolving on every
-    call. This is a micro-optimization but more importantly it ensures the
-    containment check uses a single, consistent root throughout the walk.
+    entry is resolved once and compared against the resolved root. This is a
+    micro-optimization but more importantly it ensures the containment check
+    uses a single, consistent root throughout the walk.
     """
     files: list[tuple[int, Path]] = []
     try:
@@ -85,14 +85,22 @@ def _collect_files_under(root: Path, root_resolved: Path) -> list[tuple[int, Pat
                 try:
                     if entry.is_dir(follow_symlinks=False):
                         sub = Path(entry.path)
-                        if not _is_path_under(sub, root_resolved):
+                        try:
+                            sub_resolved = sub.resolve(strict=False)
+                        except OSError:
+                            continue
+                        if not sub_resolved.is_relative_to(root_resolved):
                             continue
                         files.extend(_collect_files_under(sub, root_resolved))
                     else:
                         st = entry.stat(follow_symlinks=False)
                         if stat.S_ISREG(st.st_mode):
                             p = Path(entry.path)
-                            if not _is_path_under(p, root_resolved):
+                            try:
+                                p_resolved = p.resolve(strict=False)
+                            except OSError:
+                                continue
+                            if not p_resolved.is_relative_to(root_resolved):
                                 continue
                             files.append((st.st_size, p))
                 except OSError:
