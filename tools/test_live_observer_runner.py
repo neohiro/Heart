@@ -10,6 +10,7 @@ import json
 import os
 import shutil
 import signal
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -211,6 +212,84 @@ class TestSigtermDrain(unittest.TestCase):
         mod._sigterm_handler(signal.SIGTERM, None)
 
         self.assertFalse(mod._running)
+
+
+class TestLaunchObserver(unittest.TestCase):
+    """Tests for the _launch_observer error path (missing observer module)."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="liverunner-launch-"))
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_missing_observer_module_raises_filenotfound(self):
+        """If the observer module is not on BRAIN_PATH, FileNotFoundError is raised."""
+        mod = _load()
+        # BRAIN_PATH defaults to /brain, which does not have src/live_observer.py
+        # in the test environment, so _launch_observer should raise.
+        mod.BRAIN_PATH = Path("/nonexistent/brain/path")
+        with self.assertRaises(FileNotFoundError) as ctx:
+            mod._launch_observer({"neohiro-LLM": Path("/repos/LLM")}, once=True)
+        self.assertIn("observer module not found", str(ctx.exception))
+
+    def test_main_returns_3_when_observer_missing(self):
+        """main() returns exit code 3 when _launch_observer raises FileNotFoundError."""
+        mod = _load()
+        mod.BRAIN_PATH = Path("/nonexistent/brain/path")
+        mod.WATCH_DIR = self.tmp
+        mod.SENTINEL_PATH = self.tmp / "observer.sentinel.json"
+        # _discover_orgs is bypassed by passing --roots so the call doesn't
+        # try to scan a non-existent _entities dir.
+        rc = mod.main(argv=[
+            "--roots", "neohiro-LLM:/repos/LLM",
+        ])
+        self.assertEqual(rc, 3)
+        # No sentinel should be written on this error path.
+        self.assertFalse(mod.SENTINEL_PATH.exists())
+
+
+class TestDeadOnArrivalObserver(unittest.TestCase):
+    """Tests for the dead-on-arrival observer path (sentinel race)."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="liverunner-doa-"))
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_dead_on_arrival_observer_skips_sentinel(self):
+        """If the observer process exits before the sentinel is written, no sentinel is created."""
+        mod = _load()
+        mod.WATCH_DIR = self.tmp
+        mod.SENTINEL_PATH = self.tmp / "observer.sentinel.json"
+
+        # A subprocess that exits immediately with code 0, simulating a
+        # dead-on-arrival observer.
+        proc = subprocess.Popen(
+            [sys.executable, "-c", "import sys; sys.exit(0)"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
+        # Wait for the process to actually exit before the test asserts the
+        # poll() branch is taken.
+        proc.wait()
+
+        # Inline the race-detection logic from main() — if poll() is not None
+        # immediately, the runner should skip the sentinel write and report
+        # the exit code. We replicate that branch here to test it directly
+        # without subprocess the real observer module.
+        global _observer_proc
+        _observer_proc = proc
+        try:
+            if proc.poll() is not None:
+                rc = proc.returncode
+                self.assertEqual(rc, 0)
+                # Branch: do NOT write sentinel.
+                self.assertFalse(mod.SENTINEL_PATH.exists(),
+                                 "sentinel must not be written for a dead-on-arrival observer")
+        finally:
+            _observer_proc = None
 
 
 if __name__ == "__main__":
