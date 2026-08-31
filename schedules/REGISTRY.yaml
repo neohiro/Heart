@@ -187,6 +187,23 @@ scopes:
     flags: ["--quiet"]
     status: implemented   # 2026-08-31
 
+  - id: github-notifications
+    description: "iot/SPEC_GITHUB_NOTIFICATIONS.md: drain /var/lib/iot/cache/github/, normalize, route to (1) Brain awareness per-repo counters + event log, (2) userdata notifications (age-encrypted via memory_bridge.write_notification), (3) Mouth headlines jsonl. Audit log: /var/lib/userdata/audit/github_notifications.jsonl. Rate-limited per-org (200/min default). Also wired into Heart phase `ingest_github_notifications` for in-cycle ingest."
+    path: Heart/tools/github_notifications_heart.py
+    schedule: every_1_minutes
+    timeout_seconds: 30
+    retry_on_failure: true
+    max_retries: 2
+    env:
+      IOT_CACHE_DIR: "/var/lib/iot/cache"
+      BRAIN_AWARENESS_GITHUB_DIR: "/var/lib/brain/awareness/github"
+      BRAIN_STATE_DIR: "/var/lib/brain/state"
+      USERDATA_DIR: "/var/lib/userdata"
+      MOUTH_HEADLINES_DIR: "/var/lib/mouth/headlines"
+      GITHUB_TRACKED_LOGINS: "${GITHUB_TRACKED_LOGINS:-wout,admin}"
+    flags: ["--once"]
+    status: implemented   # 2026-08-31
+
   - id: userdata-memory-bridge
     description: "Userdata memory bridge: read age-encrypted profiles, episodes, interests, hearsay from neohiro/userdata; write Brain entity projections. Bridges private-assistant canonical memory to Brain awareness."
     path: Heart/tools/memory_bridge_heart.py
