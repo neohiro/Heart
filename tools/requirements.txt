@@ -1,4 +1,4 @@
 # Heart Python bridge dependencies
 # structlog is the only required dep; PyYAML is optional (used when present).
-structlog>=24.1.0
+structlog>=26.1.0
 PyYAML>=6.0.3
