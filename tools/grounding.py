@@ -279,7 +279,6 @@ def _read_last_cycle_rate() -> tuple[float | None, str | None]:
     if not p.is_file():
         return None, None
     try:
-        import json
         with p.open('r', encoding='utf-8') as f:
             data = json.load(f)
         rate = data.get('grounding_rate')
@@ -465,7 +464,6 @@ def main() -> int:
     # the longitudinal log but is not used for the poke policy (see comment
     # on _read_last_cycle_rate).
     try:
-        import json
         _last_rate_path().write_text(json.dumps(aggregate_entry), encoding='utf-8')
     except OSError:
         print('grounding: warning: cannot write grounding.last_rate.json', file=sys.stderr)

@@ -27,6 +27,11 @@ def _load(name: str | None = None) -> object:
     mod_name = name or f"live_observer_runner_{_load_count}"
     spec = importlib.util.spec_from_file_location(mod_name, str(TOOL_PATH))
     mod = importlib.util.module_from_spec(spec)
+    # Add Heart/tools to sys.path so the module can resolve `from atomic import ...`
+    # when its own code does the deferred import.
+    tools_dir = str(TOOL_PATH.parent)
+    if tools_dir not in sys.path:
+        sys.path.insert(0, tools_dir)
     spec.loader.exec_module(mod)
     return mod
 

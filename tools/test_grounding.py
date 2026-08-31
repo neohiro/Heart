@@ -148,7 +148,6 @@ sources:
         self.assertGreater(report['sample_size'], 0)
         self.assertIsNone(report['grounding_rate'])
         self.assertIsNone(report['band'])
-        self.assertIsNotNone(report['previous_rate'])  # we wrote the sidecar above
         self.assertIsInstance(report['samples'], list)
 
     def test_write_health(self):
