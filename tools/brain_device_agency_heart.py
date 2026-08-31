@@ -377,7 +377,7 @@ def _iso_now() -> str:
 
 
 def _processed_marker_from_path(fb_path: Path) -> Path:
-    return _get_feedback_dir() / f".{fb_path.name}.processed"
+    return _get_feedback_dir() / f".{fb_path.stem}.processed"
 
 
 def run_once(brain_path: Path | None = None) -> dict[str, Any]:
