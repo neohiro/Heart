@@ -92,10 +92,13 @@ def _discover_orgs() -> dict[str, Path]:
             continue
         for r in repo_list:
             local = REPO_ROOT / r
+            # Scope names must match live_observer's ^[A-Za-z0-9_-]{1,64}$.
+            # Map the org/repo separator to "-" so the scope is valid.
+            scope = f"{org}-{r}".replace("/", "-")
             if local.is_dir():
-                roots[f"{org}/{r}"] = local
+                roots[scope] = local
             elif (REPO_ROOT / org / r).is_dir():
-                roots[f"{org}/{r}"] = REPO_ROOT / org / r
+                roots[scope] = REPO_ROOT / org / r
     return roots
 
 
@@ -167,6 +170,9 @@ def main() -> int:
             if not entry or ":" not in entry:
                 continue
             scope, path = entry.split(":", 1)
+            # live_observer requires scopes to match ^[A-Za-z0-9_-]{1,64}$.
+            # Map "/" to "-" so "neohiro/LLM" -> "neohiro-LLM" before validation.
+            scope = scope.replace("/", "-")
             if not re.match(r"^[A-Za-z0-9_-]{1,64}$", scope):
                 print(f"[live_observer_runner] invalid scope {scope!r}, skipping", file=sys.stderr)
                 continue
