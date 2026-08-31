@@ -9,7 +9,11 @@ file so Heart and doctor can confirm the daemon is alive.
 Run:
     python Heart/tools/live_observer_runner.py           # daemon mode
     python Heart/tools/live_observer_runner.py --once    # scan once, emit, exit
-    python Heart/tools/live_observer_runner.py --roots neohiro:/neohiro   # override
+    python Heart/tools/live_observer_runner.py --roots neohiro-LLM:/repos/LLM   # override
+
+Note: scope names must match live_observer's regex (^[A-Za-z0-9_-]{1,64}$).
+"neohiro/LLM" is invalid; the runner maps "/" -> "-" so the discovered
+scopes (org-repofmt) are accepted by live_observer.
 
 Sentinel:
     /shared/brain/watch/observer.sentinel.json

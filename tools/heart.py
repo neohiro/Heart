@@ -65,7 +65,6 @@ from pathlib import Path
 from typing import Any
 
 import structlog
-from atomic import write_text, write_yaml, write_yaml_multi_doc  # noqa: E402  (after _TOOLS_DIR path setup)
 
 # Ensure Heart/tools/ is on sys.path for sibling imports (e.g. abuse_bridge)
 _TOOLS_DIR = Path(__file__).resolve().parent
@@ -76,6 +75,8 @@ _WORKSPACE = _TOOLS_DIR.parent.parent
 for _p in (str(_WORKSPACE), str(_WORKSPACE / "userdata" / "src"), str(_WORKSPACE / "Brain" / "src")):
     if _p not in sys.path:
         sys.path.insert(0, _p)
+
+from atomic import write_text, write_yaml, write_yaml_multi_doc
 
 from Heart.tools import heart_shared_prune
 

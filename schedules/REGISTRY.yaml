@@ -199,7 +199,7 @@ scopes:
       USERDATA_IDENTITY_DIR: "/var/lib/userdata/identities"
       BRAIN_ENTITY_DIR: "/shared/brain/_entities"
       GODADMIN_IDENTITY: "${GODADMIN_IDENTITY:-}"
-    flags: ["--quiet", "--heart-mode"]
+    flags: ["--quiet"]
     status: implemented   # 2026-08-31
 
   - id: live-observer
