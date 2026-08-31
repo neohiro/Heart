@@ -61,9 +61,10 @@ import sys
 import tempfile
 import time
 from collections import defaultdict, deque
+from collections.abc import Iterable
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 # Make sibling Heart/scripts/_lib importable
 _HERE = Path(__file__).resolve().parent
@@ -379,9 +380,7 @@ def _route_to_brain(event: dict, *, dry_run: bool) -> dict[str, Any] | None:
         state = (subj.get("state") or "").lower()
         if action == "opened" or (action in {"reopened", "ready_for_review"} and state == "open"):
             _apply_counter_delta(counters, "open_prs", +1)
-        elif action == "closed" and state != "merged":
-            _apply_counter_delta(counters, "open_prs", -1)
-        elif action == "closed" and state == "merged":
+        elif (action == "closed" and state != "merged") or (action == "closed" and state == "merged"):
             _apply_counter_delta(counters, "open_prs", -1)
     elif et == "issues":
         state = (subj.get("state") or "").lower()
