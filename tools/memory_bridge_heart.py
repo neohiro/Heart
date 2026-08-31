@@ -79,7 +79,7 @@ def _decrypt_age(path: Path, identities: list[str]) -> bytes | None:
         pt = Path(tmp) / "plaintext"
         for i, ident in enumerate(identities):
             cmd = ["age", "-d", "-i", ident, "-o", str(pt), str(path)]
-            r = subprocess.run(cmd, capture_output=True)
+            r = subprocess.run(cmd, capture_output=True, timeout=30)
             if r.returncode == 0:
                 return pt.read_bytes()
         return None

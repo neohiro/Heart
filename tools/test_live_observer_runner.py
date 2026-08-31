@@ -144,7 +144,7 @@ class TestSentinelWrite(unittest.TestCase):
         mod = _load()
         mod.WATCH_DIR = self._watch
         mod.SENTINEL_PATH = self._watch / "observer.sentinel.json"
-        mod._sentinel_write(12345, {"neohiro/LLM": "/repos/LLM"}, ok=True)
+        mod._sentinel_write(12345, {"neohiro-LLM": "/repos/LLM"}, ok=True)
         data = json.loads(mod.SENTINEL_PATH.read_text(encoding="utf-8"))
         self.assertEqual(data["pid"], 12345)
         self.assertEqual(data["ok"], True)
