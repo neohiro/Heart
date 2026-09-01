@@ -1,0 +1,34 @@
+# Heart/schedules/repo-migrate/schedule.yaml
+#
+# Per-scope schedule for Heart/schedules/REGISTRY.yaml -> repo-migrate.
+# See HEART_SCHEDULE_REGISTRY.md for the schema and Heart/SPEC.md for the
+# populator-script contract.
+
+scope: repo-migrate
+description: >
+  Poll neohiro/repo-audit/migrations.json for pending transfers
+  (status=pending, type=transfer).  Dispatch the GitHub Actions
+  fallback workflow to execute the migration.
+  Writes:
+    - /shared/heart/repo_migrate/pending.json  (current pending list)
+    - /shared/heart/repo_migrate/heartbeat.jsonl  (append-only audit)
+    - /shared/heart/repo_migrate/last_updated   (ISO timestamp)
+
+schedule: every_24_hours
+timeout_seconds: 600
+retry_on_failure: true
+max_retries: 1
+fallback_github_actions: .github/workflows/repo-migrate-fallback.yml
+env:
+  NEOHIRO_SHARED_ROOT: "/shared"
+  NEOHIRO_REPO_AUDIT_URL: "https://raw.githubusercontent.com/neohiro/repo-audit/main/migrations.json"
+  NEOHIRO_REPO_MIGRATE_DISPATCH_URL: "https://api.github.com/repos/neohiro/voicemail/actions/workflows/repo-migrate-fallback.yml/dispatches"
+flags: ["--quiet"]
+
+outputs:
+  - path: /shared/heart/repo_migrate/pending.json
+    schema: repo_migrate.pending
+    consumer: neohiro-brain (internal)
+  - path: /shared/heart/repo_migrate/heartbeat.jsonl
+    schema: repo_migrate.heartbeat
+    consumer: audit (append-only)

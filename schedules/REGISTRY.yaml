@@ -347,6 +347,28 @@ scopes:
     status: scaffold       # 2026-08-31
 
 
+  - id: repo-migrate
+    description: >
+      Poll neohiro/repo-audit/migrations.json for status:pending + type:transfer
+      entries. Dispatch the GitHub Actions fallback workflow
+      (neohiro/voicemail/.github/workflows/repo-migrate-fallback.yml) with the
+      pending source list as inputs. The fallback workflow calls
+      execute-all.ps1 -Phase 2 -Execute for each source.
+      Written to /shared/heart/repo_migrate/pending.json.
+      See neohiro/repo-audit/MANUAL_MIGRATION.md for the full runbook.
+    path: Heart/scripts/repo-migrate/run.py
+    schedule: every_24_hours
+    timeout_seconds: 600
+    retry_on_failure: true
+    max_retries: 1
+    fallback_github_actions: .github/workflows/repo-migrate-fallback.yml
+    env:
+      NEOHIRO_SHARED_ROOT: "/shared"
+      NEOHIRO_REPO_AUDIT_URL: "https://raw.githubusercontent.com/neohiro/repo-audit/main/migrations.json"
+      NEOHIRO_REPO_MIGRATE_DISPATCH_URL: "https://api.github.com/repos/neohiro/voicemail/actions/workflows/repo-migrate-fallback.yml/dispatches"
+    flags: ["--quiet"]
+    status: scaffold       # 2026-09-01
+
   - id: grounding-audit
     description: "GROUNDING.md §2: sample N (entity, datapoint) pairs from sources.yaml, re-fetch from source, compare vs cached, write grounding.jsonl + /shared/public/health/grounding.json. Emits poke if rate < 0.90 for two consecutive cycles."
     path: Heart/tools/grounding.py
