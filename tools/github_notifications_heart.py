@@ -56,14 +56,16 @@ import argparse
 import contextlib
 import json
 import os
+import re
 import secrets
 import shutil
+import socket
 import sys
 import tempfile
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -262,7 +264,7 @@ def _metrics_path() -> Path:
     return _shared_root() / "heart" / "metrics" / "github_notifications.prom"
 
 
-def _write_metrics(counters: dict, *, cycle_duration_ms: int, backlog: int) -> None:
+def _write_metrics(counters: dict, *, cycle_duration_ms: int, backlog: int, backlog_real: int) -> None:
     try:
         p = _metrics_path()
         p.parent.mkdir(parents=True, exist_ok=True)
@@ -281,9 +283,12 @@ def _write_metrics(counters: dict, *, cycle_duration_ms: int, backlog: int) -> N
         lines.append("# HELP github_notifications_cycle_duration_ms Last cycle duration.")
         lines.append("# TYPE github_notifications_cycle_duration_ms gauge")
         lines.append(f"github_notifications_cycle_duration_ms {int(cycle_duration_ms)}")
-        lines.append("# HELP github_notifications_backlog Pending cache files at end of cycle.")
+        lines.append("# HELP github_notifications_backlog Pending cache files at end of cycle (includes intentional skips).")
         lines.append("# TYPE github_notifications_backlog gauge")
         lines.append(f"github_notifications_backlog {int(backlog)}")
+        lines.append("# HELP github_notifications_backlog_real Pending files minus intentional skips (oversized + unknown_type + no_org_repo).")
+        lines.append("# TYPE github_notifications_backlog_real gauge")
+        lines.append(f"github_notifications_backlog_real {int(backlog_real)}")
         _atomic_write_text(p, "\n".join(lines) + "\n")
     except Exception as e:
         log.warning("metrics_write_failed", error=f"{type(e).__name__}: {e}")
@@ -391,6 +396,125 @@ def _load_shared_processed_set() -> set[str]:
             if len(out) > 100_000:  # safety: avoid unbounded growth
                 break
     except Exception:
+        pass
+    return out
+
+
+# ─── HA lease mechanism (Proposal 3) ────────────────────────────────────────
+#
+# In a multi-Heart deployment, each host can lease the right to process
+# specific delivery_ids for a short window. Other hosts honour the lease
+# and skip those delivery_ids, preventing double-counting brain counters.
+#
+# Lease file: $NEOHIRO_SHARED_ROOT/brain/state/github_lease_{host}.json
+# Schema: {"owner": "host", "expires_at": iso8601, "in_progress": [delivery_id, ...]}
+#
+# A lease is honoured if its expires_at is in the future. Stale leases
+# (host crashed mid-cycle) are ignored.
+
+LEASE_DURATION_SECONDS = max(10, int(os.environ.get("GITHUB_NOTIFY_LEASE_SECONDS", "120")))
+LEASES_DIR = Path("")  # set lazily via _leases_dir()
+
+
+def _leases_dir() -> Path:
+    return _shared_root() / "brain" / "state"
+
+
+def _lease_path(host_id: str) -> Path:
+    safe = re.sub(r"[^A-Za-z0-9_-]", "_", host_id or "unknown")
+    return _leases_dir() / f"github_lease_{safe}.json"
+
+
+def _host_id() -> str:
+    """Return a stable per-host identifier (env override or hostname fallback)."""
+    return os.environ.get("GITHUB_NOTIFY_HOST_ID") or socket.gethostname() or "unknown"
+
+
+def _acquire_lease(in_progress: list[str], *, ttl: int = LEASE_DURATION_SECONDS) -> Path | None:
+    """Write a lease for this host claiming the in-flight delivery_ids.
+
+    Returns the lease path on success, None on failure (best-effort).
+    """
+    host = _host_id()
+    p = _lease_path(host)
+    now = datetime.now(timezone.utc)
+    payload = {
+        "owner": host,
+        "acquired_at": now.isoformat(),
+        "expires_at": (now + timedelta(seconds=ttl)).isoformat(),
+        "in_progress": list(in_progress),
+    }
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        _atomic_write_json(p, payload)
+        return p
+    except Exception as e:
+        log.warning("ha_lease_write_failed", host=host, error=f"{type(e).__name__}: {e}")
+        return None
+
+
+def _release_lease(in_progress: list[str]) -> None:
+    """Remove delivery_ids from the in-progress set; delete the lease if empty."""
+    host = _host_id()
+    p = _lease_path(host)
+    if not p.is_file():
+        return
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return
+        existing = data.get("in_progress", [])
+        if not isinstance(existing, list):
+            existing = []
+        # Filter out completed delivery_ids
+        remaining = [x for x in existing if x not in set(in_progress)]
+        if not remaining:
+            with contextlib.suppress(OSError):
+                p.unlink()
+        else:
+            data["in_progress"] = remaining
+            data["expires_at"] = (
+                datetime.now(timezone.utc) + timedelta(seconds=LEASE_DURATION_SECONDS)
+            ).isoformat()
+            _atomic_write_json(p, data)
+    except (OSError, json.JSONDecodeError):
+        # Stale or corrupt lease; remove it.
+        with contextlib.suppress(OSError):
+            p.unlink()
+
+
+def _load_active_leases() -> set[str]:
+    """Return union of all in-progress delivery_ids from non-expired leases."""
+    out: set[str] = set()
+    now = datetime.now(timezone.utc)
+    leases = _leases_dir()
+    if not leases.is_dir():
+        return out
+    try:
+        for p in leases.iterdir():
+            if not p.is_file() or not p.name.startswith("github_lease_") or not p.name.endswith(".json"):
+                continue
+            try:
+                data = json.loads(p.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                # Stale/corrupt lease: treat as expired.
+                with contextlib.suppress(OSError):
+                    p.unlink()
+                continue
+            if not isinstance(data, dict):
+                continue
+            try:
+                exp = datetime.fromisoformat(str(data.get("expires_at", "")).replace("Z", "+00:00"))
+            except (ValueError, AttributeError):
+                continue
+            if exp <= now:
+                with contextlib.suppress(OSError):
+                    p.unlink()
+                continue
+            for did in data.get("in_progress", []) or []:
+                if did:
+                    out.add(str(did))
+    except OSError:
         pass
     return out
 
@@ -845,14 +969,27 @@ def run_once(*, dry_run: bool = False, reset_processed: bool = False, quiet: boo
         log.warning("github_notifications_quiet_noisy_logs")
     t0 = time.monotonic()
     processed_ids = _load_processed_set(reset=reset_processed)
+    # Track IDs newly added in this cycle (for HA lease publication at cycle end).
+    processed_this_cycle: set[str] = set()
 
     # HA dedup: merge in delivery_ids seen by other Heart instances in the
     # cluster. Read once per cycle, then merge; do not write back (the local
-    # cursor is the source of truth, the shared ledger is a secondary check).
+    # cursor is the source of truth; the shared ledger is a secondary check).
+    # Also honour active leases: any delivery_ids another host is currently
+    # processing are skipped to prevent double-counting on concurrent cycles.
     if os.environ.get("GITHUB_NOTIFY_HA_DEDUP", "0") == "1":
         shared_ids = _load_shared_processed_set()
         if shared_ids:
             processed_ids |= shared_ids
+        active_leases_ids = _load_active_leases()
+        if active_leases_ids:
+            skipped_by_lease = 0
+            for did in active_leases_ids:
+                if did not in processed_ids:
+                    skipped_by_lease += 1
+                    processed_ids.add(did)
+            if skipped_by_lease:
+                log.debug("ha_leases_skipped", count=skipped_by_lease)
 
     limiter = _PerOrgRateLimiter()
 
@@ -874,6 +1011,9 @@ def run_once(*, dry_run: bool = False, reset_processed: bool = False, quiet: boo
     last_event_at: str | None = None
     files_processed = 0
     files_seen_total = 0  # track incrementally to avoid re-iterating dir at end for backlog
+    # Skipped-but-intentional = not-yet-processed files that were correctly filtered
+    # (oversized, unknown type, no org/repo). These are excluded from real backlog.
+    files_skipped_intentional = 0
 
     for path in _iter_cache_files(IOT_CACHE_DIR):
         files_seen_total += 1
@@ -886,10 +1026,11 @@ def run_once(*, dry_run: bool = False, reset_processed: bool = False, quiet: boo
         try:
             if path.stat().st_size > MAX_CACHE_FILE_BYTES:
                 counters["events_skipped_oversized"] = counters.get("events_skipped_oversized", 0) + 1
-                # Mark as processed to avoid retrying
+                files_skipped_intentional += 1
                 if path.name.endswith(".json"):
                     delivery = path.name.split("-")[1] if "-" in path.name else "unknown"
                     processed_ids.add(delivery)
+                    processed_this_cycle.add(delivery)
                 continue
         except OSError:
             pass  # If stat fails, let _load_event_from_cache handle it
@@ -903,7 +1044,9 @@ def run_once(*, dry_run: bool = False, reset_processed: bool = False, quiet: boo
         et = str(event.get("event_type", ""))
         if et not in ROUTED_EVENT_TYPES:
             counters["events_skipped_unknown_type"] = counters.get("events_skipped_unknown_type", 0) + 1
+            files_skipped_intentional += 1
             processed_ids.add(str(event["delivery_id"]))
+            processed_this_cycle.add(str(event["delivery_id"]))
             continue
 
         delivery = str(event["delivery_id"])
@@ -922,7 +1065,9 @@ def run_once(*, dry_run: bool = False, reset_processed: bool = False, quiet: boo
         repo = str(event.get("repo", "")).strip()
         if not org or not repo:
             counters["events_skipped_no_org_repo"] += 1
+            files_skipped_intentional += 1
             processed_ids.add(delivery)
+            processed_this_cycle.add(delivery)
             continue
         if not limiter.allow(org):
             counters["events_skipped_rate_limited"] += 1
@@ -952,6 +1097,7 @@ def run_once(*, dry_run: bool = False, reset_processed: bool = False, quiet: boo
         if headline_emitted:
             counters["headlines_emitted"] += 1
         processed_ids.add(delivery)
+        processed_this_cycle.add(delivery)
         ts = event.get("received_at")
         if ts and (last_event_at is None or str(ts) > last_event_at):
             last_event_at = str(ts)
@@ -993,10 +1139,13 @@ def run_once(*, dry_run: bool = False, reset_processed: bool = False, quiet: boo
     # Write Prometheus metrics (best-effort, non-fatal)
     if not dry_run:
         cycle_ms = int((time.monotonic() - t0) * 1000)
-        # Backlog = files we saw but did NOT process (skipped or already-processed).
-        # Tracked incrementally to avoid re-iterating the directory after the main loop.
+        # backlog = files we saw but did NOT process (skipped or already-processed).
+        # backlog_real = backlog minus intentional skips (oversized, unknown type,
+        # no org/repo). Only backlog_real triggers a poke — intentional skips are
+        # healthy, not degradation.
         backlog = files_seen_total - files_processed
-        _write_metrics(counters, cycle_duration_ms=cycle_ms, backlog=backlog)
+        backlog_real = max(0, backlog - files_skipped_intentional)
+        _write_metrics(counters, cycle_duration_ms=cycle_ms, backlog=backlog, backlog_real=backlog_real)
 
         # Pokes on degradation (deduped via fingerprint sidecar, 1h TTL).
         # Suppress pokes in `--once` mode (manual operator run) to avoid spam.
@@ -1012,12 +1161,18 @@ def run_once(*, dry_run: bool = False, reset_processed: bool = False, quiet: boo
                 priority="medium",
                 fingerprint="rate-limit-saturation",
             )
-        if backlog >= BACKLOG_POKE_THRESHOLD:
+        if backlog_real >= BACKLOG_POKE_THRESHOLD:
             _emit_poke(
-                reason=f"cache backlog {backlog} files (threshold {BACKLOG_POKE_THRESHOLD})",
+                reason=f"real backlog {backlog_real} files (threshold {BACKLOG_POKE_THRESHOLD})",
                 priority="medium",
                 fingerprint="cache-backlog",
             )
+
+        # HA: publish a lease so other Heart instances know what this host
+        # processed this cycle. The lease is a JSON file with a TTL; other
+        # hosts honour it to prevent double-counting during concurrent cycles.
+        if os.environ.get("GITHUB_NOTIFY_HA_DEDUP", "0") == "1" and processed_this_cycle:
+            _acquire_lease(list(processed_this_cycle))
 
     return counters
 
