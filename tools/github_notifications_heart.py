@@ -341,7 +341,14 @@ def _save_processed_set(ids: set[str], last_event_at: str | None) -> None:
             shared_ledger = _shared_root() / "brain" / "state" / "github_processed_set.jsonl"
             shared_ledger.parent.mkdir(parents=True, exist_ok=True)
             with shared_ledger.open("a", encoding="utf-8") as f:
-                for d in ordered[-100:]:  # only flush the tail to keep writes bounded
+                # Write the last 100 ids in insertion order (approximate recency).
+                # We iterate `ordered` and keep a sliding window of the last 100.
+                tail: list[str] = []
+                for d in ordered:
+                    tail.append(d)
+                    if len(tail) > 100:
+                        tail = tail[1:]
+                for d in tail:
                     f.write(json.dumps({"delivery_id": d, "ts": _now_iso()}) + "\n")
             # Compact if > 1 MB (rotate to .1, .2, ...)
             try:
@@ -416,9 +423,6 @@ try:
     LEASE_DURATION_SECONDS = max(10, int(os.environ.get("GITHUB_NOTIFY_LEASE_SECONDS", "120")))
 except ValueError:
     LEASE_DURATION_SECONDS = 120
-LEASES_DIR = Path("")  # set lazily via _leases_dir()
-
-
 def _leases_dir() -> Path:
     return _shared_root() / "brain" / "state"
 
@@ -1122,12 +1126,16 @@ def run_once(*, dry_run: bool = False, reset_processed: bool = False, quiet: boo
     # The cursor file is cheap to write; the alternative is that replayed
     # deliveries get re-processed on every cycle, which would double-count
     # brain counters. (See test_replay_does_not_double_count.)
+    #
+    # NOTE: even in dry_run the cursor is persisted. This means a subsequent
+    # non-dry-run cycle will skip events already in the cursor. This is the
+    # current (2026-09) design: dry-run advances the cursor so the next
+    # production cycle does not double-process. If you want a true no-op
+    # dry-run that does not touch state, invoke `run_once(dry_run=True)` in
+    # isolation and do not follow with a non-dry-run cycle.
     if not dry_run:
         _save_processed_set(processed_ids, last_event_at)
     else:
-        # Even in dry_run we persist the cursor so the operator can verify
-        # what *would* be marked processed without polluting counts. This
-        # is also the contract the test suite relies on.
         try:
             _save_processed_set(processed_ids, last_event_at)
         except Exception as e:
