@@ -35,9 +35,13 @@ def main() -> int:
         sys.stderr.write(f"ERROR: {SCRIPT} not found\n")
         return 1
 
+    env = os.environ.copy()
+    if "GH_TOKEN" in env and "GITHUB_TOKEN" not in env:
+        env["GITHUB_TOKEN"] = env["GH_TOKEN"]
+
     cmd = ["python", SCRIPT, "--org", "all", "--apply"]
     print(f"[doctor-sync-heart] Running: {' '.join(cmd)}", flush=True)
-    result = subprocess.run(cmd)
+    result = subprocess.run(cmd, env=env)
     return result.returncode
 
 
