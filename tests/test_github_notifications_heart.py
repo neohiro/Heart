@@ -15,14 +15,14 @@ from __future__ import annotations
 import sys
 import time
 from pathlib import Path
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 
-import Heart.tools.github_notifications_heart as gh_h
+import Heart.tools.github_notifications_heart as gh_h  # noqa: E402
 
 
 class TestPerOrgRateLimiter:
