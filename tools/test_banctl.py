@@ -221,10 +221,11 @@ class TestValidation(unittest.TestCase):
 
         # List
         list_args = argparse.Namespace(format='text')
-        self.mod.cmd_list(list_args)
+        ret = self.mod.cmd_list(list_args)
+        self.assertEqual(ret, 0)
 
-        # Remove
-        rem_args = argparse.Namespace(ban_id='ban-2026-08-30-001')
+        # Remove — use the dynamically generated ban ID (today's date)
+        rem_args = argparse.Namespace(ban_id='ban-2026-09-01-001')
         ret = self.mod.cmd_remove(rem_args)
         self.assertEqual(ret, 0)
 
