@@ -615,9 +615,7 @@ def _awareness_path(org: str, repo: str) -> Path:
 
 def _safe_slug(s: str) -> str:
     """Reduce to a safe filesystem slug."""
-    import re as _re
-
-    cleaned = _re.sub(r"[^A-Za-z0-9._-]", "_", s or "")
+    cleaned = re.sub(r"[^A-Za-z0-9._-]", "_", s or "")
     if cleaned in (".", "..", "") or cleaned.startswith("."):
         cleaned = "unknown"
     return cleaned
