@@ -1170,19 +1170,15 @@ def run_once(*, dry_run: bool = False, reset_processed: bool = False, quiet: boo
     # deliveries get re-processed on every cycle, which would double-count
     # brain counters. (See test_replay_does_not_double_count.)
     #
-    # NOTE: even in dry_run the cursor is persisted. This means a subsequent
-    # non-dry-run cycle will skip events already in the cursor. This is the
-    # current (2026-09) design: dry-run advances the cursor so the next
-    # production cycle does not double-process. If you want a true no-op
-    # dry-run that does not touch state, invoke `run_once(dry_run=True)` in
-    # isolation and do not follow with a non-dry-run cycle.
-    if not dry_run:
+    # NOTE: the cursor is persisted in BOTH dry-run and non-dry-run modes. This
+    # is intentional: dry-run advances the cursor so a subsequent production
+    # cycle does not double-process events. If you need a true no-op dry-run
+    # that does not touch state, invoke `run_once(dry_run=True)` in isolation
+    # and do not follow with a non-dry-run cycle.
+    try:
         _save_processed_set(processed_ids, last_event_at)
-    else:
-        try:
-            _save_processed_set(processed_ids, last_event_at)
-        except Exception as e:
-            log.warning("dry_run_cursor_save_failed", error=f"{type(e).__name__}: {e}")
+    except Exception as e:
+        log.warning("cursor_save_failed", error=f"{type(e).__name__}: {e}")
 
     log.info(
         "github_notifications_cycle",
