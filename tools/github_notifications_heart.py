@@ -1214,8 +1214,16 @@ def run_once(*, dry_run: bool = False, reset_processed: bool = False, quiet: boo
         # backlog_real = backlog minus intentional skips (oversized, unknown type,
         # no org/repo). Only backlog_real triggers a poke — intentional skips are
         # healthy, not degradation.
+        # files_skipped_intentional tracks files excluded from real backlog.
+        # events_skipped_file_limit (load-shedding skip) is also excluded since
+        # the backlog would clear on the next cycle if the operator raised the limit.
         backlog = files_seen_total - files_processed
-        backlog_real = max(0, backlog - files_skipped_intentional)
+        backlog_real = max(
+            0,
+            backlog
+            - files_skipped_intentional
+            - counters.get("events_skipped_file_limit", 0),
+        )
         _write_metrics(counters, cycle_duration_ms=cycle_ms, backlog=backlog, backlog_real=backlog_real)
 
         # Pokes on degradation (deduped via fingerprint sidecar, 1h TTL).
