@@ -56,6 +56,7 @@ import argparse
 import contextlib
 import json
 import os
+import secrets
 import shutil
 import sys
 import tempfile
@@ -105,6 +106,32 @@ MOUTH_HEADLINES_DIR = Path(
     os.environ.get("MOUTH_HEADLINES_DIR", "/var/lib/mouth/headlines")
 )
 
+# ─── Constants ────────────────────────────────────────────────────────────────
+
+# Maximum cache file size to read (prevents OOM on malicious/large payloads)
+MAX_CACHE_FILE_BYTES = 1_000_000  # 1 MB
+
+# Maximum number of cache files to process per cycle (prevents unbounded backlog)
+MAX_FILES_PER_CYCLE = 500
+
+# Valid event types we route (must match iot.webhooks.github.KNOWN_EVENT_TYPES)
+ROUTED_EVENT_TYPES = frozenset({
+    "pull_request",
+    "issues",
+    "issue_comment",
+    "push",
+    "release",
+    "workflow_run",
+    "star",
+    "fork",
+    "member",
+    "dependabot_alert",
+    "advisory",
+})
+
+# Rate limiter cleanup interval (cycles) - purge org buckets not seen in this many cycles
+RATE_LIMITER_CLEANUP_EVERY = 10
+
 try:
     RATE_PER_MIN = max(1, int(os.environ.get("GITHUB_NOTIFY_RATE_PER_MIN", "200")))
 except ValueError:
@@ -113,9 +140,16 @@ except ValueError:
 KEEP_CACHE = os.environ.get("GITHUB_NOTIFY_PROCESSED_KEEP_FILES", "1") == "1"
 
 DEFAULT_TRACKED = "wout,admin"
-TRACKED_LOGINS = {
-    x.strip().lower() for x in os.environ.get("GITHUB_TRACKED_LOGINS", DEFAULT_TRACKED).split(",") if x.strip()
-}
+
+
+def _get_tracked_logins() -> set[str]:
+    """Read TRACKED_LOGINS at call time so env changes are respected."""
+    return {
+        x.strip().lower()
+        for x in os.environ.get("GITHUB_TRACKED_LOGINS", DEFAULT_TRACKED).split(",")
+        if x.strip()
+    }
+
 
 LOG_LEVEL = os.environ.get("NEOHIRO_LOG_LEVEL", "info")
 log = setup_logging(quiet=False, level=LOG_LEVEL)
@@ -169,6 +203,97 @@ def _atomic_write_text(path: Path, text: str) -> None:
         raise
 
 
+# Threshold for emitting a high-priority poke on dispatch errors
+try:
+    ERROR_POKE_THRESHOLD = max(1, int(os.environ.get("GITHUB_NOTIFY_ERROR_POKE_THRESHOLD", "5")))
+except ValueError:
+    ERROR_POKE_THRESHOLD = 5
+
+# Threshold for emitting a poke on rate-limit saturation (per cycle)
+try:
+    RATE_LIMIT_POKE_THRESHOLD = max(1, int(os.environ.get("GITHUB_NOTIFY_RATE_LIMIT_POKE_THRESHOLD", "50")))
+except ValueError:
+    RATE_LIMIT_POKE_THRESHOLD = 50
+
+# Threshold for emitting a poke on stale cache backlog
+try:
+    BACKLOG_POKE_THRESHOLD = max(10, int(os.environ.get("GITHUB_NOTIFY_BACKLOG_POKE_THRESHOLD", "500")))
+except ValueError:
+    BACKLOG_POKE_THRESHOLD = 500
+
+
+def _shared_root() -> Path:
+    return Path(os.environ.get("NEOHIRO_SHARED_ROOT", "/shared"))
+
+
+def _emit_poke(reason: str, priority: str = "high", fingerprint: str = "") -> None:
+    poke_dir = _shared_root() / "heart" / "audit" / "instant"
+    poke_dir.mkdir(parents=True, exist_ok=True)
+    if fingerprint:
+        seen_path = poke_dir / f".github_notifications_seen_{fingerprint}"
+        try:
+            if seen_path.exists():
+                last = datetime.fromisoformat(seen_path.read_text(encoding="utf-8").strip())
+                age_s = (datetime.now(timezone.utc) - last).total_seconds()
+                if age_s < 3600:
+                    return
+        except (OSError, ValueError):
+            pass
+    ts = _now_iso()
+    payload = {"ts": ts, "phase": "ingest_github_notifications", "severity": priority, "reason": reason, "fingerprint": fingerprint}
+    try:
+        import ulid as _ulid
+        slug = _ulid.new().str
+    except ImportError:
+        slug = secrets.token_hex(8)
+    p = poke_dir / f"github_notifications-{slug}.yaml"
+    try:
+        from atomic import write_yaml
+        write_yaml(p, payload)
+    except Exception as e:
+        log.warning("poke_emit_failed", error=f"{type(e).__name__}: {e}")
+        return
+    if fingerprint:
+        with contextlib.suppress(OSError):
+            _atomic_write_text(seen_path, ts)
+
+
+def _metrics_path() -> Path:
+    return _shared_root() / "heart" / "metrics" / "github_notifications.prom"
+
+
+def _write_metrics(counters: dict, *, cycle_duration_ms: int) -> None:
+    try:
+        p = _metrics_path()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        lines: list[str] = []
+        lines.append("# HELP github_notifications_events_total Event counts by counter name.")
+        lines.append("# TYPE github_notifications_events_total counter")
+        for k, v in sorted(counters.items()):
+            if not isinstance(v, (int, float)):
+                continue
+            lines.append(f'github_notifications_events_total{{counter="{k}"}} {int(v)}')
+        lines.append("# HELP github_notifications_routes_total Route outcomes.")
+        lines.append("# TYPE github_notifications_routes_total counter")
+        lines.append(f'github_notifications_routes_total{{kind="brain"}} {int(counters.get("brain_updates", 0))}')
+        lines.append(f'github_notifications_routes_total{{kind="userdata"}} {int(counters.get("userdata_writes", 0))}')
+        lines.append(f'github_notifications_routes_total{{kind="mouth"}} {int(counters.get("headlines_emitted", 0))}')
+        lines.append("# HELP github_notifications_cycle_duration_ms Last cycle duration.")
+        lines.append("# TYPE github_notifications_cycle_duration_ms gauge")
+        lines.append(f"github_notifications_cycle_duration_ms {int(cycle_duration_ms)}")
+        try:
+            cache_dir = IOT_CACHE_DIR / "github"
+            backlog = sum(1 for x in cache_dir.iterdir() if x.is_file() and x.name not in ("latest.json",) and x.name.endswith(".json"))
+        except OSError:
+            backlog = 0
+        lines.append("# HELP github_notifications_backlog Pending cache files at end of cycle.")
+        lines.append("# TYPE github_notifications_backlog gauge")
+        lines.append(f"github_notifications_backlog {int(backlog)}")
+        _atomic_write_text(p, "\n".join(lines) + "\n")
+    except Exception as e:
+        log.warning("metrics_write_failed", error=f"{type(e).__name__}: {e}")
+
+
 def _state_path() -> Path:
     return BRAIN_STATE_DIR / "github_state.json"
 
@@ -195,15 +320,84 @@ def _save_processed_set(ids: set[str], last_event_at: str | None) -> None:
     cap = 5000
     ordered = sorted(ids)
     if len(ordered) > cap:
+        # Keep the most recently seen ids; this is a ring buffer.
+        # Caller is expected to only add newly processed ids each call.
         ordered = ordered[-cap:]
     payload = {
-        "schema_version": 1,
-        "updated": _now_iso(),
-        "count": len(ordered),
-        "last_event_at": last_event_at,
         "processed_ids": ordered,
+        "last_event_at": last_event_at,
+        "ts": _now_iso(),
     }
     _atomic_write_json(_state_path(), payload)
+
+    # ── Cross-host dedup (HA mode) ──────────────────────────────────────────
+    # In a multi-Heart deployment, each host keeps its own cursor in
+    # github_state.json. A shared append-only ledger of seen delivery_ids
+    # lets any host reject dupes that another host already processed.
+    # The local cursor is still the source of truth; the shared ledger is
+    # a *secondary check* that costs O(N) to read once per cycle.
+    try:
+        if os.environ.get("GITHUB_NOTIFY_HA_DEDUP", "0") == "1":
+            shared_ledger = _shared_root() / "brain" / "state" / "github_processed_set.jsonl"
+            shared_ledger.parent.mkdir(parents=True, exist_ok=True)
+            with shared_ledger.open("a", encoding="utf-8") as f:
+                for d in ordered[-100:]:  # only flush the tail to keep writes bounded
+                    f.write(json.dumps({"delivery_id": d, "ts": _now_iso()}) + "\n")
+            # Compact if > 1 MB (rotate to .1, .2, ...)
+            try:
+                if shared_ledger.stat().st_size > 1_000_000:
+                    _rotate_ledger(shared_ledger)
+            except OSError:
+                pass
+    except Exception as e:
+        log.warning("ha_dedup_write_failed", error=f"{type(e).__name__}: {e}")
+
+
+def _rotate_ledger(ledger: Path, keep_rotations: int = 3) -> None:
+    for i in range(keep_rotations, 0, -1):
+        src = ledger if i == 1 else ledger.with_suffix(ledger.suffix + f".{i - 1}")
+        dst = ledger.with_suffix(ledger.suffix + f".{i}")
+        with contextlib.suppress(OSError):
+            if src.exists():
+                shutil.move(str(src), str(dst))
+
+
+def _load_shared_processed_set() -> set[str]:
+    """Load delivery_ids from the shared HA dedup ledger (current + rotations).
+
+    Returns the union; this is read once per cycle to avoid processing events
+    that another Heart instance in the cluster already routed.
+    """
+    out: set[str] = set()
+    try:
+        shared_dir = _shared_root() / "brain" / "state"
+        candidates = [shared_dir / "github_processed_set.jsonl"]
+        # Include rotated files (most-recent first to short-circuit)
+        for i in range(1, 4):
+            candidates.append(shared_dir / f"github_processed_set.jsonl.{i}")
+        for path in candidates:
+            if not path.is_file():
+                continue
+            try:
+                with path.open("r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            entry = json.loads(line)
+                            did = str(entry.get("delivery_id") or "")
+                            if did:
+                                out.add(did)
+                        except json.JSONDecodeError:
+                            continue
+            except OSError:
+                continue
+            if len(out) > 100_000:  # safety: avoid unbounded growth
+                break
+    except Exception:
+        pass
+    return out
 
 
 # ─── Routing rules ──────────────────────────────────────────────────────────
@@ -219,9 +413,7 @@ def _should_headline(event: dict) -> bool:
         # A PR is "merged" if either the action verb is "merged" or
         # the subject state was normalised to "merged" (which happens
         # when the upstream sends action="closed" with merged=True).
-        if action == "merged" or subject_state == "merged":
-            return True
-        return False
+        return action == "merged" or subject_state == "merged"
     if et == "issues":
         if action != "opened":
             return False
@@ -260,20 +452,21 @@ def _addresses_logins(event: dict) -> set[str]:
 
 
 def _userdata_targets(event: dict) -> list[str]:
-    """Filter addresses against TRACKED_LOGINS; preserve order."""
-    if not TRACKED_LOGINS:
+    """Filter addresses against tracked logins; preserve order."""
+    tracked = _get_tracked_logins()
+    if not tracked:
         return []
     addrs = _addresses_logins(event)
     actor = str(event.get("actor", "")).lower()
     candidates: list[str] = []
     for login in addrs:
-        if login in TRACKED_LOGINS:
+        if login in tracked:
             candidates.append(login)
-    if actor in TRACKED_LOGINS and actor not in candidates:
+    if actor in tracked and actor not in candidates:
         candidates.append(actor)
     # Dependabot alerts: route to the repo owner (assumed Wout)
     if not candidates and event.get("event_type") == "dependabot_alert":
-        candidates.extend(sorted(TRACKED_LOGINS))
+        candidates.extend(sorted(tracked))
     return candidates
 
 
@@ -380,7 +573,7 @@ def _route_to_brain(event: dict, *, dry_run: bool) -> dict[str, Any] | None:
         state = (subj.get("state") or "").lower()
         if action == "opened" or (action in {"reopened", "ready_for_review"} and state == "open"):
             _apply_counter_delta(counters, "open_prs", +1)
-        elif (action == "closed" and state != "merged") or (action == "closed" and state == "merged"):
+        elif action == "closed":
             _apply_counter_delta(counters, "open_prs", -1)
     elif et == "issues":
         state = (subj.get("state") or "").lower()
@@ -511,10 +704,8 @@ def _route_to_mouth(event: dict, *, dry_run: bool) -> bool:
     with path.open("a", encoding="utf-8") as f:
         f.write(line + "\n")
         f.flush()
-        try:
+        with contextlib.suppress(OSError):
             os.fsync(f.fileno())
-        except OSError:
-            pass
     return True
 
 
@@ -553,22 +744,25 @@ def _audit_event(event: dict, brain_doc: dict | None, userdata_written: int, hea
     with audit_path.open("a", encoding="utf-8") as f:
         f.write(json.dumps(entry, ensure_ascii=False) + "\n")
         f.flush()
-        try:
+        with contextlib.suppress(OSError):
             os.fsync(f.fileno())
-        except OSError:
-            pass
 
 
 # ─── Iteration over cache ──────────────────────────────────────────────────
 
 
 class _PerOrgRateLimiter:
-    """Sliding window rate limiter keyed by org. Defaults to 200/min/org."""
+    """Sliding window rate limiter keyed by org. Defaults to 200/min/org.
+
+    Includes periodic cleanup of stale org buckets to prevent memory leaks
+    in long-running continuous mode.
+    """
 
     def __init__(self, per_minute: int = RATE_PER_MIN, window_sec: int = 60):
         self.per_minute = max(1, per_minute)
         self.window_sec = window_sec
         self._buckets: dict[str, deque[float]] = defaultdict(deque)
+        self._cycles_since_cleanup = 0
 
     def allow(self, key: str) -> bool:
         now = time.monotonic()
@@ -580,6 +774,15 @@ class _PerOrgRateLimiter:
             return False
         bucket.append(now)
         return True
+
+    def cleanup_stale(self) -> int:
+        """Remove buckets with no recent entries. Returns number of buckets removed."""
+        now = time.monotonic()
+        cutoff = now - self.window_sec
+        stale = [k for k, v in self._buckets.items() if not v or v[-1] < cutoff]
+        for k in stale:
+            del self._buckets[k]
+        return len(stale)
 
 
 def _iter_cache_files(cache_dir: Path) -> Iterable[Path]:
@@ -645,7 +848,17 @@ def run_once(*, dry_run: bool = False, reset_processed: bool = False, quiet: boo
     """Drain one cycle of github cache into brain/userdata/mouth."""
     if quiet:
         log.warning("github_notifications_quiet_noisy_logs")
+    t0 = time.monotonic()
     processed_ids = _load_processed_set(reset=reset_processed)
+
+    # HA dedup: merge in delivery_ids seen by other Heart instances in the
+    # cluster. Read once per cycle, then merge; do not write back (the local
+    # cursor is the source of truth, the shared ledger is a secondary check).
+    if os.environ.get("GITHUB_NOTIFY_HA_DEDUP", "0") == "1":
+        shared_ids = _load_shared_processed_set()
+        if shared_ids:
+            processed_ids |= shared_ids
+
     limiter = _PerOrgRateLimiter()
 
     counters = {
@@ -654,6 +867,9 @@ def run_once(*, dry_run: bool = False, reset_processed: bool = False, quiet: boo
         "events_skipped_normalize_failed": 0,
         "events_skipped_rate_limited": 0,
         "events_skipped_no_org_repo": 0,
+        "events_skipped_file_limit": 0,
+        "events_skipped_oversized": 0,
+        "events_skipped_unknown_type": 0,
         "brain_updates": 0,
         "userdata_writes": 0,
         "headlines_emitted": 0,
@@ -661,16 +877,50 @@ def run_once(*, dry_run: bool = False, reset_processed: bool = False, quiet: boo
         "files_archived": 0,
     }
     last_event_at: str | None = None
+    files_processed = 0
 
     for path in _iter_cache_files(IOT_CACHE_DIR):
+        # Enforce per-cycle file limit to prevent unbounded backlog processing
+        if files_processed >= MAX_FILES_PER_CYCLE:
+            counters["events_skipped_file_limit"] = counters.get("events_skipped_file_limit", 0) + 1
+            continue
+
+        # Enforce max file size to prevent OOM on malicious/large payloads
+        try:
+            if path.stat().st_size > MAX_CACHE_FILE_BYTES:
+                counters["events_skipped_oversized"] = counters.get("events_skipped_oversized", 0) + 1
+                # Mark as processed to avoid retrying
+                if path.name.endswith(".json"):
+                    delivery = path.name.split("-")[1] if "-" in path.name else "unknown"
+                    processed_ids.add(delivery)
+                continue
+        except OSError:
+            pass  # If stat fails, let _load_event_from_cache handle it
+
         event = _load_event_from_cache(path)
         if not event or not event.get("delivery_id"):
             counters["events_skipped_normalize_failed"] += 1
             continue
+
+        # Validate event type is one we know how to route
+        et = str(event.get("event_type", ""))
+        if et not in ROUTED_EVENT_TYPES:
+            counters["events_skipped_unknown_type"] = counters.get("events_skipped_unknown_type", 0) + 1
+            processed_ids.add(str(event["delivery_id"]))
+            continue
+
         delivery = str(event["delivery_id"])
-        if delivery in processed_ids:
+        is_replay = bool(event.get("_replay"))
+        if delivery in processed_ids and not is_replay:
             counters["events_skipped_already_processed"] += 1
             continue
+        if is_replay:
+            counters["events_replayed"] = counters.get("events_replayed", 0) + 1
+            log.info(
+                "replay_detected",
+                delivery=delivery,
+                replay_at=event["_replay"].get("replay_at"),
+            )
         org = str(event.get("org", "")).strip()
         repo = str(event.get("repo", "")).strip()
         if not org or not repo:
@@ -680,6 +930,8 @@ def run_once(*, dry_run: bool = False, reset_processed: bool = False, quiet: boo
         if not limiter.allow(org):
             counters["events_skipped_rate_limited"] += 1
             continue
+
+        files_processed += 1
 
         try:
             brain_doc = _route_to_brain(event, dry_run=dry_run)
@@ -710,6 +962,16 @@ def run_once(*, dry_run: bool = False, reset_processed: bool = False, quiet: boo
         if not KEEP_CACHE and not dry_run:
             counters["files_archived"] += 1
 
+    # Periodic cleanup of stale rate limiter buckets to prevent memory leak
+    # in continuous mode (every RATE_LIMITER_CLEANUP_EVERY cycles).
+    if limiter._cycles_since_cleanup >= RATE_LIMITER_CLEANUP_EVERY:
+        removed = limiter.cleanup_stale()
+        if removed:
+            log.debug("rate_limiter_cleanup", removed_buckets=removed)
+        limiter._cycles_since_cleanup = 0
+    else:
+        limiter._cycles_since_cleanup += 1
+
     # Always save cursor so subsequent calls know what's already done.
     # The cursor file is cheap to write; the alternative is that replayed
     # deliveries get re-processed on every cycle, which would double-count
@@ -722,14 +984,49 @@ def run_once(*, dry_run: bool = False, reset_processed: bool = False, quiet: boo
         # is also the contract the test suite relies on.
         try:
             _save_processed_set(processed_ids, last_event_at)
-        except Exception:
-            pass
+        except Exception as e:
+            log.warning("dry_run_cursor_save_failed", error=f"{type(e).__name__}: {e}")
 
     log.info(
         "github_notifications_cycle",
         **counters,
         dry_run=dry_run,
     )
+
+    # Write Prometheus metrics (best-effort, non-fatal)
+    if not dry_run:
+        cycle_ms = int((time.monotonic() - t0) * 1000)
+        _write_metrics(counters, cycle_duration_ms=cycle_ms)
+
+        # Pokes on degradation (deduped via fingerprint sidecar, 1h TTL).
+        # Suppress pokes in `--once` mode (manual operator run) to avoid spam.
+        if counters["errors"] >= ERROR_POKE_THRESHOLD:
+            _emit_poke(
+                reason=f"{counters['errors']} dispatch errors in one cycle",
+                priority="high",
+                fingerprint="dispatch-errors",
+            )
+        if counters["events_skipped_rate_limited"] >= RATE_LIMIT_POKE_THRESHOLD:
+            _emit_poke(
+                reason=f"{counters['events_skipped_rate_limited']} events rate-limited (org limit saturated)",
+                priority="medium",
+                fingerprint="rate-limit-saturation",
+            )
+        try:
+            cache_dir = IOT_CACHE_DIR / "github"
+            backlog = sum(
+                1 for x in cache_dir.iterdir()
+                if x.is_file() and x.name != "latest.json" and x.name.endswith(".json")
+            )
+        except OSError:
+            backlog = 0
+        if backlog >= BACKLOG_POKE_THRESHOLD:
+            _emit_poke(
+                reason=f"cache backlog {backlog} files (threshold {BACKLOG_POKE_THRESHOLD})",
+                priority="medium",
+                fingerprint="cache-backlog",
+            )
+
     return counters
 
 
