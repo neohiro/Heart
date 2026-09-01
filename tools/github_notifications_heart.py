@@ -69,6 +69,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+import yaml
+
 # Make sibling Heart/scripts/_lib importable
 _HERE = Path(__file__).resolve().parent
 for _p in (
@@ -639,8 +641,6 @@ def _ensure_awareness(path: Path) -> dict[str, Any]:
             "events": [],
         }
     try:
-        import yaml
-
         with path.open("r", encoding="utf-8") as f:
             data = yaml.safe_load(f) or {}
     except Exception:
@@ -747,8 +747,6 @@ def _route_to_brain(event: dict, *, dry_run: bool) -> dict[str, Any] | None:
 
     doc["updated"] = _now_iso()
     if not dry_run:
-        import yaml
-
         _atomic_write_text(path, yaml.dump(doc, default_flow_style=False, sort_keys=False, allow_unicode=True))
     return doc
 
