@@ -1465,6 +1465,7 @@ def _phase_ingest_github_notifications(state: CycleState) -> PhaseResult:
     """
     t0 = time.monotonic()
     error = ""
+    repos_touched = 0
 
     if DRY_RUN:
         elapsed = int((time.monotonic() - t0) * 1000)
@@ -1479,7 +1480,7 @@ def _phase_ingest_github_notifications(state: CycleState) -> PhaseResult:
         log.warning("phase_ingest_github_notifications_error", error=error)
 
     elapsed = int((time.monotonic() - t0) * 1000)
-    log.info("phase_ingest_github_notifications", elapsed_ms=elapsed, repos_touched=repos_touched if 'repos_touched' in dir() else 0)
+    log.info("phase_ingest_github_notifications", elapsed_ms=elapsed, repos_touched=repos_touched)
     return PhaseResult(
         name="ingest_github_notifications",
         ok=not error,
