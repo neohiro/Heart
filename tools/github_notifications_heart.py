@@ -412,7 +412,10 @@ def _load_shared_processed_set() -> set[str]:
 # A lease is honoured if its expires_at is in the future. Stale leases
 # (host crashed mid-cycle) are ignored.
 
-LEASE_DURATION_SECONDS = max(10, int(os.environ.get("GITHUB_NOTIFY_LEASE_SECONDS", "120")))
+try:
+    LEASE_DURATION_SECONDS = max(10, int(os.environ.get("GITHUB_NOTIFY_LEASE_SECONDS", "120")))
+except ValueError:
+    LEASE_DURATION_SECONDS = 120
 LEASES_DIR = Path("")  # set lazily via _leases_dir()
 
 
