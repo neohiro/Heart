@@ -151,6 +151,97 @@ try:
 except ImportError:
     pass  # iot not on path; skip assertion
 
+# ─── Routing dedup cache ────────────────────────────────────────────────────────
+# Tracks delivery_ids that have been routed (brain/userdata/mouth) so that
+# replays of the same delivery_id skip re-routing. This prevents duplicate
+# awareness writes, duplicate notifications, and duplicate headlines on replay.
+# Uses a TTL-based sliding window (1h per entry) so stale entries expire naturally.
+# Lives in _shared_root() so it is shared across HA instances.
+_ROUTING_DEDUP_TTL_SECONDS = 3600
+
+
+class _RoutingDedup:
+    """LRU-style dedup cache keyed by delivery_id.
+
+    Each entry stores (ts: float) so we can expire stale entries without
+    a background thread. Implemented as an ordered dict — O(1) hit/miss,
+    O(N) eviction on write when the cap is reached.
+    """
+
+    def __init__(self, path: Path, *, max_size: int = 50_000) -> None:
+        self._path = path
+        self._max_size = max_size
+        self._data: dict[str, float] = {}  # delivery_id -> timestamp
+        self._loaded = False
+
+    def _ensure_loaded(self) -> None:
+        if self._loaded:
+            return
+        self._loaded = True
+        if not self._path.is_file():
+            return
+        try:
+            for line in self._path.read_text(encoding="utf-8").splitlines():
+                if not line.strip():
+                    continue
+                try:
+                    entry = json.loads(line)
+                    if isinstance(entry, dict) and "delivery_id" in entry and "ts" in entry:
+                        self._data[str(entry["delivery_id"])] = float(entry["ts"])
+                except (json.JSONDecodeError, ValueError, TypeError):
+                    continue
+        except OSError:
+            pass
+
+    def _evict_stale(self) -> None:
+        now = time.time()
+        stale = [k for k, ts in self._data.items() if now - ts > _ROUTING_DEDUP_TTL_SECONDS]
+        for k in stale:
+            del self._data[k]
+
+    def _evict_to_capacity(self) -> None:
+        while len(self._data) >= self._max_size:
+            # Remove oldest entries (first in insertion order, which is arbitrary
+            # but bounded — we just need to keep the set finite).
+            oldest = next(iter(self._data), None)
+            if oldest is None:
+                break
+            del self._data[oldest]
+
+    def _persist(self) -> None:
+        try:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            self._path.write_text(
+                "\n".join(json.dumps({"delivery_id": k, "ts": v}) for k, v in self._data.items()) + "\n",
+                encoding="utf-8",
+            )
+        except OSError:
+            pass
+
+    def seen(self, delivery_id: str) -> bool:
+        self._ensure_loaded()
+        self._evict_stale()
+        return delivery_id in self._data
+
+    def mark(self, delivery_id: str) -> None:
+        self._ensure_loaded()
+        self._evict_stale()
+        if delivery_id not in self._data:
+            self._evict_to_capacity()
+        self._data[delivery_id] = time.time()
+        self._persist()
+
+
+# Singleton — lazily initialized on first use.
+_routing_dedup: _RoutingDedup | None = None
+
+
+def _get_routing_dedup() -> _RoutingDedup:
+    global _routing_dedup
+    if _routing_dedup is None:
+        _routing_dedup = _RoutingDedup(_shared_root() / "brain" / "state" / "github_routing_dedup.jsonl")
+    return _routing_dedup
+
 # Rate limiter cleanup interval (cycles) - purge org buckets not seen in this many cycles
 RATE_LIMITER_CLEANUP_EVERY = 10
 
@@ -1148,6 +1239,19 @@ def run_once(*, dry_run: bool = False, reset_processed: bool = False, quiet: boo
             counters["events_skipped_rate_limited"] += 1
             continue
 
+        # Per-route dedup: skip re-routing if the same delivery_id was already
+        # routed within the TTL window. This prevents duplicate awareness writes,
+        # duplicate notifications, and duplicate headlines on replay (especially
+        # when `bypass_cursor=True` replays write a fresh cache file).
+        if _get_routing_dedup().seen(delivery):
+            counters["events_skipped_recently_routed"] = counters.get("events_skipped_recently_routed", 0) + 1
+            processed_ids.add(delivery)
+            processed_this_cycle.add(delivery)
+            _archive_cache_file(path, dry_run=dry_run)
+            if not KEEP_CACHE and not dry_run:
+                counters["files_archived"] += 1
+            continue
+
         files_processed += 1
 
         try:
@@ -1164,6 +1268,9 @@ def run_once(*, dry_run: bool = False, reset_processed: bool = False, quiet: boo
             )
             # Don't mark processed on error: next cycle will retry.
             continue
+
+        # Mark the delivery_id as routed to prevent duplicate routing on replay.
+        _get_routing_dedup().mark(delivery)
 
         counters["events_seen"] += 1
         if brain_doc is not None:

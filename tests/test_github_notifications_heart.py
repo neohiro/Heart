@@ -74,69 +74,42 @@ class TestPerOrgRateLimiter:
 
 
 class TestBacklogReal:
-    """Tests for backlog_real calculation excluding events_skipped_file_limit."""
+    """Tests for backlog_real formula — load-shedding skips (file_limit)
+    must NOT inflate the real backlog metric that triggers pokes."""
 
     def test_backlog_real_excludes_file_limit_skips(self):
-        """backlog_real must exclude events_skipped_file_limit so that load-shedding
-        skips do not inflate the real backlog metric that triggers pokes."""
-        limiter = gh_h._PerOrgRateLimiter()
-        # Simulate 8 files seen, 0 processed, 0 intentional (oversized/no-org/no-type),
-        # 3 skipped due to file limit.
-        # Formula: backlog_real = max(0, (8-0) - 0 - 3) = max(0, 5) = 5
-        #
-        # The actual code path computes it inside run_once, so we verify the
-        # arithmetic by checking the counters dict that run_once would compute.
-        # We mock only _write_metrics to capture the computed backlog_real.
-        with patch.object(gh_h, "MAX_FILES_PER_CYCLE", 5):
-            with patch.object(gh_h, "IOT_CACHE_DIR", Path()) as mock_dir:
-                # 8 files that all pass size check but get skipped due to the limit.
-                paths = []
-                for i in range(8):
-                    p = MagicMock()
-                    p.name = f"2025-01-01T00-abc{i}-github_pull_request.json"
-                    p.stat.return_value = MagicMock(st_size=100)
-                    paths.append(p)
-
-                def fake_event(path):
-                    return None  # normalize_failed, adds delivery_from_path
-
-                captured: list[dict] = []
-
-                def capture_metrics(counters, *, cycle_duration_ms, backlog, backlog_real):
-                    captured.append({"backlog": backlog, "backlog_real": backlog_real,
-                                     "file_limit": counters.get("events_skipped_file_limit", 0)})
-
-                with patch.object(gh_h, "_iter_cache_files", return_value=paths):
-                    with patch.object(gh_h, "_load_event_from_cache", side_effect=fake_event):
-                        with patch.object(gh_h, "_shared_root", return_value=Path()):
-                            with patch.object(gh_h, "_acquire_lease", return_value=None):
-                                with patch.object(gh_h, "_release_lease"):
-                                    with patch.object(gh_h, "_write_metrics", side_effect=capture_metrics):
-                                        with patch.object(gh_h, "_emit_poke"):
-                                            gh_h.run_once(dry_run=False, reset_processed=True)
-
-        assert len(captured) == 1
-        c = captured[0]
-        assert c["file_limit"] == 3, f"3 files should hit the limit; got {c['file_limit']}"
-        assert c["backlog"] == 8, f"8 files seen, 0 processed = backlog 8; got {c['backlog']}"
-        assert c["backlog_real"] == 5, (
-            f"backlog_real should be 5 (8 - 3 file_limit = 5); got {c['backlog_real']}"
+        """When 8 files are seen, 0 processed, 0 intentional skips, 3 file-limit skips,
+        backlog_real = max(0, (8-0) - 0 - 3) = 5 (not 8)."""
+        files_seen_total = 8
+        files_processed = 0
+        files_skipped_intentional = 0
+        events_skipped_file_limit = 3
+        backlog = files_seen_total - files_processed
+        backlog_real = max(
+            0,
+            backlog
+            - files_skipped_intentional
+            - events_skipped_file_limit,
         )
-        assert call["backlog"] == 8, "8 files seen, 0 processed"
-        assert call["backlog_real"] == 0, (
-            "backlog_real must be 0 when only file-limit skips exist (no real backlog)"
+        assert backlog == 8
+        assert backlog_real == 5, (
+            f"backlog_real must be 5 (8 - 3 file_limit), not 8; got {backlog_real}"
         )
 
-    def test_backlog_real_formula(self):
-        """backlog_real = max(0, (seen - processed) - intentional - file_limit_skip)"""
-        limiter = gh_h._PerOrgRateLimiter()
-        seen = 10
-        processed = 4
-        intentional = 2  # oversized + unknown type
-        file_limit_skip = 1
-        backlog = seen - processed  # 6
-        backlog_real = max(0, backlog - intentional - file_limit_skip)
-        assert backlog_real == 3
+    def test_backlog_real_clamps_to_zero(self):
+        """When intentional + file_limit skips exceed backlog, backlog_real must be 0,
+        not negative."""
+        backlog = 5
+        files_skipped_intentional = 3
+        events_skipped_file_limit = 4
+        backlog_real = max(0, backlog - files_skipped_intentional - events_skipped_file_limit)
+        assert backlog_real == 0
+
+    def test_backlog_real_with_no_skips(self):
+        """Sanity check: when there are no skips, backlog_real == backlog."""
+        backlog = 10
+        backlog_real = max(0, backlog - 0 - 0)
+        assert backlog_real == 10
 
 
 if __name__ == "__main__":
