@@ -6,9 +6,9 @@ to every repo in the 4 orgs. Runs as a Heart cycle scope.
 
 Args (forwarded to sync_doctor_workflow.py):
     --org {neohiro,frenzypenguin-media,openstageisland,transhumanists,all}
-    --apply   (apply changes; default: dry-run)
     --repo    (single 'owner/name')
     --force   (re-upload even if matches)
+    --dry-run (preview only; default is --apply)
 
 Env:
     NEOHIRO_DOCTOR_ROOT    Path to neohiro-doctor checkout (default: /brain/neohiro-doctor)
