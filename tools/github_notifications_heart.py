@@ -262,7 +262,7 @@ def _metrics_path() -> Path:
     return _shared_root() / "heart" / "metrics" / "github_notifications.prom"
 
 
-def _write_metrics(counters: dict, *, cycle_duration_ms: int) -> None:
+def _write_metrics(counters: dict, *, cycle_duration_ms: int, backlog: int) -> None:
     try:
         p = _metrics_path()
         p.parent.mkdir(parents=True, exist_ok=True)
@@ -281,11 +281,6 @@ def _write_metrics(counters: dict, *, cycle_duration_ms: int) -> None:
         lines.append("# HELP github_notifications_cycle_duration_ms Last cycle duration.")
         lines.append("# TYPE github_notifications_cycle_duration_ms gauge")
         lines.append(f"github_notifications_cycle_duration_ms {int(cycle_duration_ms)}")
-        try:
-            cache_dir = IOT_CACHE_DIR / "github"
-            backlog = sum(1 for x in cache_dir.iterdir() if x.is_file() and x.name not in ("latest.json",) and x.name.endswith(".json"))
-        except OSError:
-            backlog = 0
         lines.append("# HELP github_notifications_backlog Pending cache files at end of cycle.")
         lines.append("# TYPE github_notifications_backlog gauge")
         lines.append(f"github_notifications_backlog {int(backlog)}")
@@ -878,8 +873,10 @@ def run_once(*, dry_run: bool = False, reset_processed: bool = False, quiet: boo
     }
     last_event_at: str | None = None
     files_processed = 0
+    files_seen_total = 0  # track incrementally to avoid re-iterating dir at end for backlog
 
     for path in _iter_cache_files(IOT_CACHE_DIR):
+        files_seen_total += 1
         # Enforce per-cycle file limit to prevent unbounded backlog processing
         if files_processed >= MAX_FILES_PER_CYCLE:
             counters["events_skipped_file_limit"] = counters.get("events_skipped_file_limit", 0) + 1
@@ -996,7 +993,10 @@ def run_once(*, dry_run: bool = False, reset_processed: bool = False, quiet: boo
     # Write Prometheus metrics (best-effort, non-fatal)
     if not dry_run:
         cycle_ms = int((time.monotonic() - t0) * 1000)
-        _write_metrics(counters, cycle_duration_ms=cycle_ms)
+        # Backlog = files we saw but did NOT process (skipped or already-processed).
+        # Tracked incrementally to avoid re-iterating the directory after the main loop.
+        backlog = files_seen_total - files_processed
+        _write_metrics(counters, cycle_duration_ms=cycle_ms, backlog=backlog)
 
         # Pokes on degradation (deduped via fingerprint sidecar, 1h TTL).
         # Suppress pokes in `--once` mode (manual operator run) to avoid spam.
@@ -1012,14 +1012,6 @@ def run_once(*, dry_run: bool = False, reset_processed: bool = False, quiet: boo
                 priority="medium",
                 fingerprint="rate-limit-saturation",
             )
-        try:
-            cache_dir = IOT_CACHE_DIR / "github"
-            backlog = sum(
-                1 for x in cache_dir.iterdir()
-                if x.is_file() and x.name != "latest.json" and x.name.endswith(".json")
-            )
-        except OSError:
-            backlog = 0
         if backlog >= BACKLOG_POKE_THRESHOLD:
             _emit_poke(
                 reason=f"cache backlog {backlog} files (threshold {BACKLOG_POKE_THRESHOLD})",
