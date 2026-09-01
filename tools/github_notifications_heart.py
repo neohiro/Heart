@@ -215,8 +215,9 @@ class _RoutingDedup:
                 "\n".join(json.dumps({"delivery_id": k, "ts": v}) for k, v in self._data.items()) + "\n",
                 encoding="utf-8",
             )
-        except OSError:
-            pass
+        except OSError as e:
+            log.warning("routing_dedup_persist_failed", path=str(self._path),
+                        error=f"{type(e).__name__}: {e}", entries=len(self._data))
 
     def seen(self, delivery_id: str) -> bool:
         self._ensure_loaded()
@@ -453,12 +454,11 @@ def _save_processed_set(ids: set[str], last_event_at: str | None) -> None:
             shared_ledger.parent.mkdir(parents=True, exist_ok=True)
             with shared_ledger.open("a", encoding="utf-8") as f:
                 # Write the last 100 ids in insertion order (approximate recency).
-                # We iterate `ordered` and keep a sliding window of the last 100.
-                tail: list[str] = []
+                # deque(maxlen=100) gives O(1) appends and bounded memory; replaces
+                # the prior O(N^2) `tail = tail[1:]` slice pattern.
+                tail: deque[str] = deque(maxlen=100)
                 for d in ordered:
                     tail.append(d)
-                    if len(tail) > 100:
-                        tail = tail[1:]
                 for d in tail:
                     f.write(json.dumps({"delivery_id": d, "ts": _now_iso()}) + "\n")
             # Compact if > 1 MB (rotate to .1, .2, ...)
@@ -984,8 +984,7 @@ def _audit_event(event: dict, brain_doc: dict | None, userdata_written: int, hea
     with audit_path.open("a", encoding="utf-8") as f:
         f.write(json.dumps(entry, ensure_ascii=False) + "\n")
         f.flush()
-        with contextlib.suppress(OSError):
-            os.fsync(f.fileno())
+        os.fsync(f.fileno())
 
 
 # ─── Iteration over cache ──────────────────────────────────────────────────
