@@ -1245,6 +1245,8 @@ def run_once(*, dry_run: bool = False, reset_processed: bool = False, quiet: boo
         # when `bypass_cursor=True` replays write a fresh cache file).
         if _get_routing_dedup().seen(delivery):
             counters["events_skipped_recently_routed"] = counters.get("events_skipped_recently_routed", 0) + 1
+            counters["events_seen"] += 1
+            files_processed += 1
             processed_ids.add(delivery)
             processed_this_cycle.add(delivery)
             _archive_cache_file(path, dry_run=dry_run)
