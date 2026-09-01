@@ -944,8 +944,11 @@ def _route_to_mouth(event: dict, *, dry_run: bool) -> bool:
     with path.open("a", encoding="utf-8") as f:
         f.write(line + "\n")
         f.flush()
-        with contextlib.suppress(OSError):
-            os.fsync(f.fileno())
+        # fsync is non-optional: headlines trigger Mouth, and a kernel crash
+        # between flush() and disk write would drop the headline silently.
+        # Propagate OSError to the loop-level handler (counts as dispatch error,
+        # retried on the next cycle).
+        os.fsync(f.fileno())
     return True
 
 
@@ -1183,10 +1186,12 @@ def run_once(*, dry_run: bool = False, reset_processed: bool = False, quiet: boo
             if path.stat().st_size > MAX_CACHE_FILE_BYTES:
                 counters["events_skipped_oversized"] = counters.get("events_skipped_oversized", 0) + 1
                 files_skipped_intentional += 1
-                if path.name.endswith(".json"):
-                    delivery = path.name.split("-")[1] if "-" in path.name else "unknown"
-                    processed_ids.add(delivery)
-                    processed_this_cycle.add(delivery)
+                # Cursor update uses a unique sentinel (the full filename) so a
+                # future file that re-creates the same timestamp slug does NOT
+                # collide. Real GitHub delivery_ids are 32-char hex strings, so
+                # a `dlq:` prefix + filename is guaranteed not to collide.
+                processed_ids.add(f"dlq:oversized:{path.name}")
+                processed_this_cycle.add(f"dlq:oversized:{path.name}")
                 _write_dlq(path, "oversized", dry_run=dry_run)
                 continue
         except OSError:
@@ -1195,11 +1200,9 @@ def run_once(*, dry_run: bool = False, reset_processed: bool = False, quiet: boo
         event = _load_event_from_cache(path)
         if not event or not event.get("delivery_id"):
             counters["events_skipped_normalize_failed"] += 1
-            # Mark processed even without a delivery_id so the file doesn't loop forever.
-            delivery_from_path = path.name.split("-")[1] if "-" in path.name else None
-            if delivery_from_path:
-                processed_ids.add(delivery_from_path)
-                processed_this_cycle.add(delivery_from_path)
+            # Cursor update uses full filename as unique sentinel (see oversized path above).
+            processed_ids.add(f"dlq:normalize_failed:{path.name}")
+            processed_this_cycle.add(f"dlq:normalize_failed:{path.name}")
             _write_dlq(path, "normalize_failed", dry_run=dry_run)
             continue
 
