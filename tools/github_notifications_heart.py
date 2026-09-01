@@ -654,11 +654,20 @@ def _ensure_awareness(path: Path) -> dict[str, Any]:
         with path.open("r", encoding="utf-8") as f:
             data = yaml.safe_load(f) or {}
     except Exception:
+        # Corrupt or unreadable file: return a fresh doc with the same default
+        # counter keys as the new-file path so callers see a consistent schema.
         return {
             "schema_version": 1,
             "org": path.parent.name,
             "repo": path.stem,
-            "counters": {},
+            "counters": {
+                "open_prs": 0,
+                "open_issues": 0,
+                "workflows_failed_total": 0,
+                "releases_published_total": 0,
+                "dependabot_alerts_open": 0,
+                "events_total": 0,
+            },
             "events": [],
         }
     if not isinstance(data, dict):
