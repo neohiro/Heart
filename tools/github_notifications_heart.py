@@ -916,6 +916,15 @@ class _PerOrgRateLimiter:
             del self._buckets[k]
         return len(stale)
 
+    def maybe_cleanup(self) -> int | None:
+        """Increment cycle counter; run cleanup every CLEANUP_EVERY cycles. Returns removed count or None if not yet due."""
+        self._cycles_since_cleanup += 1
+        if self._cycles_since_cleanup >= RATE_LIMITER_CLEANUP_EVERY:
+            removed = self.cleanup_stale()
+            self._cycles_since_cleanup = 0
+            return removed
+        return None
+
 
 def _iter_cache_files(cache_dir: Path) -> Iterable[Path]:
     """Yield every json file in the github cache (excluding `latest.json` and processed/)."""
@@ -1145,13 +1154,9 @@ def run_once(*, dry_run: bool = False, reset_processed: bool = False, quiet: boo
 
     # Periodic cleanup of stale rate limiter buckets to prevent memory leak
     # in continuous mode (every RATE_LIMITER_CLEANUP_EVERY cycles).
-    if limiter._cycles_since_cleanup >= RATE_LIMITER_CLEANUP_EVERY:
-        removed = limiter.cleanup_stale()
-        if removed:
-            log.debug("rate_limiter_cleanup", removed_buckets=removed)
-        limiter._cycles_since_cleanup = 0
-    else:
-        limiter._cycles_since_cleanup += 1
+    removed = limiter.maybe_cleanup()
+    if removed:
+        log.debug("rate_limiter_cleanup", removed_buckets=removed)
 
     # Always save cursor so subsequent calls know what's already done.
     # The cursor file is cheap to write; the alternative is that replayed
