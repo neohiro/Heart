@@ -139,6 +139,18 @@ ROUTED_EVENT_TYPES = frozenset({
     "advisory",
 })
 
+# Guard: if iot.webhooks.github is available, assert ROUTED_EVENT_TYPES matches
+# KNOWN_EVENT_TYPES. A drift means events accepted by the webhook are silently
+# DLQ'd by the dispatcher — a hard-to-diagnose production gap.
+try:
+    from iot.webhooks.github import KNOWN_EVENT_TYPES as _KNOWN
+    assert ROUTED_EVENT_TYPES == _KNOWN, (
+        f"ROUTED_EVENT_TYPES differs from iot's KNOWN_EVENT_TYPES: "
+        f"extra={ROUTED_EVENT_TYPES - _KNOWN!r}  missing={_KNOWN - ROUTED_EVENT_TYPES!r}"
+    )
+except ImportError:
+    pass  # iot not on path; skip assertion
+
 # Rate limiter cleanup interval (cycles) - purge org buckets not seen in this many cycles
 RATE_LIMITER_CLEANUP_EVERY = 10
 
@@ -885,6 +897,8 @@ class _PerOrgRateLimiter:
     Includes periodic cleanup of stale org buckets to prevent memory leaks
     in long-running continuous mode.
     """
+
+    __slots__ = ("_buckets", "_cycles_since_cleanup", "per_minute", "window_sec")
 
     def __init__(self, per_minute: int = RATE_PER_MIN, window_sec: int = 60):
         self.per_minute = max(1, per_minute)
