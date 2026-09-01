@@ -108,6 +108,12 @@ MOUTH_HEADLINES_DIR = Path(
     os.environ.get("MOUTH_HEADLINES_DIR", "/var/lib/mouth/headlines")
 )
 
+# Dead-letter queue directory for events that were permanently skipped
+# (e.g. unknown event type, oversized payload, normalization failed). Files
+# here are NOT re-processed automatically; operators can inspect and replay
+# them via the iot replay endpoint.
+DLQ_DIR = Path(os.environ.get("GITHUB_NOTIFY_DLQ_DIR", str(BRAIN_STATE_DIR / "github_dlq")))
+
 # ─── Constants ────────────────────────────────────────────────────────────────
 
 # Maximum cache file size to read (prevents OOM on malicious/large payloads)
@@ -967,6 +973,27 @@ def _archive_cache_file(path: Path, *, dry_run: bool) -> None:
         log.warning("cache_archive_failed", path=str(path), error=str(e))
 
 
+def _write_dlq(event_path: Path, reason: str, *, dry_run: bool) -> None:
+    """Move a permanently-skipped event to the dead-letter queue.
+
+    DLQ files are stored under DLQ_DIR with a ".dlq" suffix so operators can
+    inspect them and replay via the iot replay endpoint.
+    """
+    if dry_run:
+        return
+    try:
+        DLQ_DIR.mkdir(parents=True, exist_ok=True)
+        dlq_name = event_path.name + ".dlq"
+        dest = DLQ_DIR / dlq_name
+        if dest.exists():
+            dlq_name = f"{event_path.stem}-{_now_iso().replace(':', '')}-{reason}{event_path.suffix}.dlq"
+            dest = DLQ_DIR / dlq_name
+        shutil.move(str(event_path), str(dest))
+        log.info("dlq_entry_written", path=str(dest), reason=reason)
+    except Exception as e:
+        log.warning("dlq_write_failed", path=str(event_path), reason=reason, error=str(e))
+
+
 # ─── Main loop ─────────────────────────────────────────────────────────────
 
 
@@ -1038,6 +1065,7 @@ def run_once(*, dry_run: bool = False, reset_processed: bool = False, quiet: boo
                     delivery = path.name.split("-")[1] if "-" in path.name else "unknown"
                     processed_ids.add(delivery)
                     processed_this_cycle.add(delivery)
+                _write_dlq(path, "oversized", dry_run=dry_run)
                 continue
         except OSError:
             pass  # If stat fails, let _load_event_from_cache handle it
@@ -1045,6 +1073,7 @@ def run_once(*, dry_run: bool = False, reset_processed: bool = False, quiet: boo
         event = _load_event_from_cache(path)
         if not event or not event.get("delivery_id"):
             counters["events_skipped_normalize_failed"] += 1
+            _write_dlq(path, "normalize_failed", dry_run=dry_run)
             continue
 
         # Validate event type is one we know how to route
@@ -1054,6 +1083,7 @@ def run_once(*, dry_run: bool = False, reset_processed: bool = False, quiet: boo
             files_skipped_intentional += 1
             processed_ids.add(str(event["delivery_id"]))
             processed_this_cycle.add(str(event["delivery_id"]))
+            _write_dlq(path, f"unknown_type:{et}", dry_run=dry_run)
             continue
 
         delivery = str(event["delivery_id"])
@@ -1075,6 +1105,7 @@ def run_once(*, dry_run: bool = False, reset_processed: bool = False, quiet: boo
             files_skipped_intentional += 1
             processed_ids.add(delivery)
             processed_this_cycle.add(delivery)
+            _write_dlq(path, "no_org_repo", dry_run=dry_run)
             continue
         if not limiter.allow(org):
             counters["events_skipped_rate_limited"] += 1
@@ -1221,6 +1252,10 @@ def get_status() -> dict[str, Any]:
     if hl.is_file():
         with hl.open("r", encoding="utf-8") as f:
             headlines_pending = sum(1 for line in f if line.strip())
+    dlq_total = 0
+    if DLQ_DIR.is_dir():
+        with contextlib.suppress(OSError):
+            dlq_total = sum(1 for p in DLQ_DIR.iterdir() if p.is_file())
     last_event_at = None
     if state.is_file():
         try:
@@ -1234,6 +1269,8 @@ def get_status() -> dict[str, Any]:
         "awareness_repos": awareness_repos,
         "userdata_notifications_total": audit_total,
         "mouth_headlines_pending": headlines_pending,
+        "dlq_total": dlq_total,
+        "dlq_path": str(DLQ_DIR),
         "last_event_at": last_event_at,
     }
 
