@@ -139,14 +139,13 @@ def _fetch_github(source: dict, var: str) -> tuple[str | None, int]:
         return None, 0
     token = os.environ.get('GH_TOKEN', '')
     url = f'https://api.github.com/repos/{repo}/{var}'
-    req = urllib.request.Request(
-        url,
-        headers={
-            'Authorization': f'Bearer {token}' if token else '',
-            'Accept': 'application/vnd.github+json',
-            'User-Agent': 'neohiro-grounding/1.0',
-        },
-    )
+    headers = {
+        'Accept': 'application/vnd.github+json',
+        'User-Agent': 'neohiro-grounding/1.0',
+    }
+    if token:
+        headers['Authorization'] = f'Bearer {token}'
+    req = urllib.request.Request(url, headers=headers)
     start = time.monotonic()
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
@@ -163,7 +162,8 @@ def _fetch_github(source: dict, var: str) -> tuple[str | None, int]:
         data = json.loads(body)
         if var == 'releases/latest':
             return data.get('tag_name'), latency
-        return str(data.get(var, data)), latency
+        val = data.get(var)
+        return (str(val) if val is not None else None), latency
     except (urllib.error.URLError, urllib.error.HTTPError, json.JSONDecodeError,
             TimeoutError, OSError) as e:
         latency = int((time.monotonic() - start) * 1000)
@@ -193,7 +193,7 @@ def _fetch_rss(source: dict) -> tuple[str | None, int]:
         latency = int((time.monotonic() - start) * 1000)
         digest = hashlib.sha256(body).hexdigest()[:16]
         return digest, latency
-    except (urllib.error.URLError, TimeoutError, OSError) as e:
+    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, OSError) as e:
         latency = int((time.monotonic() - start) * 1000)
         print(f'  [warn] rss fetch {url} failed: {e}', file=sys.stderr)
         return None, latency
@@ -463,8 +463,11 @@ def main() -> int:
     # This is the canonical "previous rate" source; the audit JSONL remains
     # the longitudinal log but is not used for the poke policy (see comment
     # on _read_last_cycle_rate).
+    # Use atomic.write_text so a crash mid-write cannot leave a partial
+    # JSON file (which would silently disable the poke policy forever).
     try:
-        _last_rate_path().write_text(json.dumps(aggregate_entry), encoding='utf-8')
+        from atomic import write_text as _atomic_write_text  # noqa: E402 (same dir)
+        _atomic_write_text(_last_rate_path(), json.dumps(aggregate_entry, indent=2))
     except OSError:
         print('grounding: warning: cannot write grounding.last_rate.json', file=sys.stderr)
 

@@ -9,6 +9,8 @@ import importlib.util
 import json
 import os
 import shutil
+import signal
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -27,11 +29,9 @@ def _load(name: str | None = None) -> object:
     mod_name = name or f"live_observer_runner_{_load_count}"
     spec = importlib.util.spec_from_file_location(mod_name, str(TOOL_PATH))
     mod = importlib.util.module_from_spec(spec)
-    # Add Heart/tools to sys.path so the module can resolve `from atomic import ...`
-    # when its own code does the deferred import.
-    tools_dir = str(TOOL_PATH.parent)
-    if tools_dir not in sys.path:
-        sys.path.insert(0, tools_dir)
+    for _p in (str(TOOL_PATH.parent), str(ROOT / "Brain" / "src")):
+        if _p not in sys.path:
+            sys.path.insert(0, _p)
     spec.loader.exec_module(mod)
     return mod
 
@@ -144,7 +144,7 @@ class TestSentinelWrite(unittest.TestCase):
         mod = _load()
         mod.WATCH_DIR = self._watch
         mod.SENTINEL_PATH = self._watch / "observer.sentinel.json"
-        mod._sentinel_write(12345, {"neohiro/LLM": "/repos/LLM"}, ok=True)
+        mod._sentinel_write(12345, {"neohiro-LLM": "/repos/LLM"}, ok=True)
         data = json.loads(mod.SENTINEL_PATH.read_text(encoding="utf-8"))
         self.assertEqual(data["pid"], 12345)
         self.assertEqual(data["ok"], True)
@@ -158,6 +158,133 @@ class TestSentinelWrite(unittest.TestCase):
         mod.SENTINEL_PATH.write_text("{}", encoding="utf-8")
         mod._sentinel_remove()
         self.assertFalse(mod.SENTINEL_PATH.exists())
+
+
+class TestSigtermDrain(unittest.TestCase):
+    """Tests for SIGTERM handler cleanup and sentinel lifecycle."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="liverunner-sigterm-"))
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_sigterm_removes_sentinel_and_no_temp_files(self):
+        """SIGTERM handler removes sentinel and leaves no temp files."""
+        mod = _load()
+        mod.WATCH_DIR = self.tmp
+        mod.SENTINEL_PATH = self.tmp / "observer.sentinel.json"
+        mod._sentinel_write(12345, {"neohiro-LLM": "/repos/LLM"}, ok=True)
+
+        self.assertTrue(mod.SENTINEL_PATH.exists())
+
+        mod._sigterm_handler(signal.SIGTERM, None)
+
+        self.assertFalse(mod.SENTINEL_PATH.exists())
+        # mkstemp uses a random suffix (e.g. ".atomic.XXXXXX.tmp") so we glob
+        # the directory for any leftover temp files instead of checking a
+        # specific name.
+        leftover_tmps = list(self.tmp.glob("*.tmp"))
+        self.assertEqual(leftover_tmps, [],
+                         f"SIGTERM leaked temp files: {leftover_tmps}")
+
+        remaining = list(self.tmp.iterdir())
+        self.assertEqual(remaining, [])
+
+    def test_sigterm_idempotent_when_no_sentinel(self):
+        """_sigterm_handler is safe to call even if sentinel does not exist."""
+        mod = _load()
+        mod.WATCH_DIR = self.tmp
+        mod.SENTINEL_PATH = self.tmp / "observer.sentinel.json"
+
+        mod._sigterm_handler(signal.SIGTERM, None)
+
+        remaining = list(self.tmp.iterdir())
+        self.assertEqual(remaining, [])
+
+    def test_running_flag_cleared_on_sigterm(self):
+        """SIGTERM sets _running to False so the watch loop exits."""
+        mod = _load()
+        mod.WATCH_DIR = self.tmp
+        mod.SENTINEL_PATH = self.tmp / "observer.sentinel.json"
+        mod._running = True
+
+        mod._sigterm_handler(signal.SIGTERM, None)
+
+        self.assertFalse(mod._running)
+
+
+class TestLaunchObserver(unittest.TestCase):
+    """Tests for the _launch_observer error path (missing observer module)."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="liverunner-launch-"))
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_missing_observer_module_raises_filenotfound(self):
+        """If the observer module is not on BRAIN_PATH, FileNotFoundError is raised."""
+        mod = _load()
+        # BRAIN_PATH defaults to /brain, which does not have src/live_observer.py
+        # in the test environment, so _launch_observer should raise.
+        mod.BRAIN_PATH = Path("/nonexistent/brain/path")
+        with self.assertRaises(FileNotFoundError) as ctx:
+            mod._launch_observer({"neohiro-LLM": Path("/repos/LLM")}, once=True)
+        self.assertIn("observer module not found", str(ctx.exception))
+
+    def test_main_returns_3_when_observer_missing(self):
+        """main() returns exit code 3 when _launch_observer raises FileNotFoundError."""
+        mod = _load()
+        mod.BRAIN_PATH = Path("/nonexistent/brain/path")
+        mod.WATCH_DIR = self.tmp
+        mod.SENTINEL_PATH = self.tmp / "observer.sentinel.json"
+        # _discover_orgs is bypassed by passing --roots so the call doesn't
+        # try to scan a non-existent _entities dir.
+        rc = mod.main(argv=[
+            "--roots", "neohiro-LLM:/repos/LLM",
+        ])
+        self.assertEqual(rc, 3)
+        # No sentinel should be written on this error path.
+        self.assertFalse(mod.SENTINEL_PATH.exists())
+
+
+class TestDeadOnArrivalObserver(unittest.TestCase):
+    """Tests for the dead-on-arrival observer path (sentinel race)."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="liverunner-doa-"))
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_dead_on_arrival_observer_skips_sentinel(self):
+        """If the observer exits before the sentinel is written, no sentinel is created."""
+        import unittest.mock
+
+        mod = _load()
+        mod.WATCH_DIR = self.tmp
+        mod.SENTINEL_PATH = self.tmp / "observer.sentinel.json"
+
+        # Patch _launch_observer to return a proc that has already exited (DOA).
+        # main() will then call poll(), see the process is dead, and skip the
+        # sentinel write. This exercises the full main() code path.
+        dead_proc = subprocess.Popen(
+            [sys.executable, "-c", "import sys; sys.exit(0)"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
+        dead_proc.wait()
+
+        with unittest.mock.patch.object(mod, "_launch_observer", return_value=dead_proc):
+            rc = mod.main(argv=["--roots", "neohiro-LLM:/repos/LLM"])
+
+        self.assertIn(rc, (1, 2),
+                      f"DOA observer should return non-zero, got {rc}")
+        self.assertFalse(mod.SENTINEL_PATH.exists(),
+                        "sentinel must not be written for a dead-on-arrival observer")
+        self.assertFalse(mod.SENTINEL_PATH.with_suffix(".tmp").exists(),
+                        "no temp files should be left behind")
 
 
 if __name__ == "__main__":

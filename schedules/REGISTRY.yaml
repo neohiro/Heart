@@ -13,7 +13,7 @@
 # write to /shared/{news,osint,links,tools}/* with atomic writes + last-good
 # fallback. Run `python -m pytest Heart/scripts/tests/` to verify.
 schema_version: 2
-last_updated: 2026-08-30
+last_updated: 2026-09-01
 
 # Scopes (one per script path). Each gets its own schedule.yaml
 # under Heart/schedules/<scope>/.
@@ -173,6 +173,179 @@ scopes:
     flags: ["--quiet", "--once"]
     status: scaffold       # 2026-08-30
 
+  - id: apis-populate
+    description: "Pull public APIs catalog from public-api-lists/apis.json; filter auth-free + CORS; write /shared/llm/tools.json and /shared/apis/cache.json."
+    path: Heart/scripts/apis-populate/run.py
+    schedule: every_6_hours
+    timeout_seconds: 120
+    retry_on_failure: true
+    max_retries: 2
+    fallback_github_actions: .github/workflows/apis-fallback.yml
+    env:
+      NEOHIRO_SHARED_ROOT: "/shared"
+      NEOHIRO_LINKS_ROOT: "/links"
+    flags: ["--quiet", "--once"]
+    status: scaffold       # 2026-08-31
+
+  - id: llm-populate
+    description: "Pull free LLM model lists from OpenRouter, HuggingFace, Groq, Together; write /shared/llm/{models,free_models,unlimited}.json."
+    path: Heart/scripts/llm-populate/run.py
+    schedule: every_1_hours
+    timeout_seconds: 90
+    retry_on_failure: true
+    max_retries: 2
+    fallback_github_actions: .github/workflows/llm-fallback.yml
+    env:
+      NEOHIRO_SHARED_ROOT: "/shared"
+    flags: ["--quiet", "--once"]
+    status: scaffold       # 2026-08-31
+
+  - id: awesome-populate
+    description: "Crawl 35+ FOSS catalog READMEs from links/feeds/awesome.yaml; extract links via selectolax; write /shared/links/awesome/<list_id>.json."
+    path: Heart/scripts/awesome-populate/run.py
+    schedule: every_24_hours
+    timeout_seconds: 300
+    retry_on_failure: true
+    max_retries: 1
+    fallback_github_actions: .github/workflows/awesome-fallback.yml
+    env:
+      NEOHIRO_SHARED_ROOT: "/shared"
+      NEOHIRO_LINKS_ROOT: "/links"
+    flags: ["--quiet", "--once"]
+    status: scaffold       # 2026-08-31
+
+  - id: links-populate
+    description: "Validate + categorize all /links/ URLs; detect dead/redirected/upgraded; write /shared/links/links.json with health + category."
+    path: Heart/scripts/links-populate/run.py
+    schedule: every_1_hours
+    timeout_seconds: 120
+    retry_on_failure: true
+    max_retries: 2
+    fallback_github_actions: .github/workflows/links-populate-fallback.yml
+    env:
+      NEOHIRO_SHARED_ROOT: "/shared"
+      NEOHIRO_LINKS_ROOT: "/links"
+    flags: ["--quiet", "--once"]
+    status: scaffold       # 2026-08-31
+
+  - id: wiki-populate
+    description: "Run Wikidata SPARQL queries for geo-tagged entities; write /shared/worldmap/knowledge.wikidata.json."
+    path: Heart/scripts/wiki-populate/run.py
+    schedule: every_24_hours
+    timeout_seconds: 180
+    retry_on_failure: true
+    max_retries: 1
+    fallback_github_actions: .github/workflows/wiki-fallback.yml
+    env:
+      NEOHIRO_SHARED_ROOT: "/shared"
+    flags: ["--quiet", "--once"]
+    status: scaffold       # 2026-08-31
+
+  - id: paper-populate
+    description: "Pull papers from OpenAlex, arXiv RSS, Crossref, Semantic Scholar; write /shared/milestones/papers.json."
+    path: Heart/scripts/paper-populate/run.py
+    schedule: every_6_hours
+    timeout_seconds: 180
+    retry_on_failure: true
+    max_retries: 2
+    fallback_github_actions: .github/workflows/paper-fallback.yml
+    env:
+      NEOHIRO_SHARED_ROOT: "/shared"
+    flags: ["--quiet", "--once"]
+    status: scaffold       # 2026-08-31
+
+  - id: patent-populate
+    description: "Pull patents from USPTO PEDS, EPO OPS, WIPO PatentScope RSS; write /shared/milestones/patents.json."
+    path: Heart/scripts/patent-populate/run.py
+    schedule: every_24_hours
+    timeout_seconds: 180
+    retry_on_failure: true
+    max_retries: 1
+    fallback_github_actions: .github/workflows/patent-fallback.yml
+    env:
+      NEOHIRO_SHARED_ROOT: "/shared"
+    flags: ["--quiet", "--once"]
+    status: scaffold       # 2026-08-31
+
+  - id: transport-populate
+    description: "Pull GTFS/GBFS feeds from MobilityDatabase, Transitland, gbfs.org; write /shared/worldmap/transport.json."
+    path: Heart/scripts/transport-populate/run.py
+    schedule: every_15_minutes
+    timeout_seconds: 90
+    retry_on_failure: true
+    max_retries: 2
+    fallback_github_actions: .github/workflows/transport-fallback.yml
+    env:
+      NEOHIRO_SHARED_ROOT: "/shared"
+    flags: ["--quiet", "--once"]
+    status: scaffold       # 2026-08-31
+
+  - id: aircraft-populate
+    description: "Pull ADS-B from OpenSky (global + per-continent bbox) and ADSBExchange; write /shared/worldmap/aircraft.json."
+    path: Heart/scripts/aircraft-populate/run.py
+    schedule: every_5_minutes
+    timeout_seconds: 60
+    retry_on_failure: true
+    max_retries: 2
+    fallback_github_actions: .github/workflows/aircraft-fallback.yml
+    env:
+      NEOHIRO_SHARED_ROOT: "/shared"
+    flags: ["--quiet", "--once"]
+    status: scaffold       # 2026-08-31
+
+  - id: iot-populate
+    description: "Pull weather (Open-Meteo), air quality (OpenAQ), Tailscale device health; write /shared/iot/<device>/latest.json."
+    path: Heart/scripts/iot-populate/run.py
+    schedule: every_5_minutes
+    timeout_seconds: 60
+    retry_on_failure: true
+    max_retries: 2
+    fallback_github_actions: .github/workflows/iot-fallback.yml
+    env:
+      NEOHIRO_SHARED_ROOT: "/shared"
+    flags: ["--quiet", "--once"]
+    status: scaffold       # 2026-08-31
+
+  - id: crypto-populate
+    description: "Pull CoinGecko prices, SEC EDGAR filings, Chainabuse scams; write /shared/monetization/public/{prices,filings,scams}.json."
+    path: Heart/scripts/crypto-populate/run.py
+    schedule: every_5_minutes
+    timeout_seconds: 60
+    retry_on_failure: true
+    max_retries: 2
+    fallback_github_actions: .github/workflows/crypto-fallback.yml
+    env:
+      NEOHIRO_SHARED_ROOT: "/shared"
+    flags: ["--quiet", "--once"]
+    status: scaffold       # 2026-08-31
+
+  - id: sitemap-walk
+    description: "Discover sitemap.xml for curated domains; recursive walk; emit new URLs to /shared/links/discovery/."
+    path: Heart/scripts/sitemap-walk/run.py
+    schedule: every_24_hours
+    timeout_seconds: 300
+    retry_on_failure: true
+    max_retries: 1
+    fallback_github_actions: .github/workflows/sitemap-fallback.yml
+    env:
+      NEOHIRO_SHARED_ROOT: "/shared"
+      NEOHIRO_LINKS_ROOT: "/links"
+    flags: ["--quiet", "--once"]
+    status: scaffold       # 2026-08-31
+
+  - id: package-populate
+    description: "Track package metadata across npm, PyPI, crates.io, Go proxy; write /shared/llm/package_health.json."
+    path: Heart/scripts/package-populate/run.py
+    schedule: every_6_hours
+    timeout_seconds: 120
+    retry_on_failure: true
+    max_retries: 2
+    fallback_github_actions: .github/workflows/package-fallback.yml
+    env:
+      NEOHIRO_SHARED_ROOT: "/shared"
+    flags: ["--quiet", "--once"]
+    status: scaffold       # 2026-08-31
+
 
   - id: grounding-audit
     description: "GROUNDING.md §2: sample N (entity, datapoint) pairs from sources.yaml, re-fetch from source, compare vs cached, write grounding.jsonl + /shared/public/health/grounding.json. Emits poke if rate < 0.90 for two consecutive cycles."
@@ -187,6 +360,23 @@ scopes:
     flags: ["--quiet"]
     status: implemented   # 2026-08-31
 
+  - id: github-notifications
+    description: "iot/SPEC_GITHUB_NOTIFICATIONS.md: drain /var/lib/iot/cache/github/, normalize, route to (1) Brain awareness per-repo counters + event log, (2) userdata notifications (age-encrypted via memory_bridge.write_notification), (3) Mouth headlines jsonl. Audit log: /var/lib/userdata/audit/github_notifications.jsonl. Rate-limited per-org (200/min default). Also wired into Heart phase `ingest_github_notifications` for in-cycle ingest."
+    path: Heart/tools/github_notifications_heart.py
+    schedule: every_1_minutes
+    timeout_seconds: 30
+    retry_on_failure: true
+    max_retries: 2
+    env:
+      IOT_CACHE_DIR: "/var/lib/iot/cache"
+      BRAIN_AWARENESS_GITHUB_DIR: "/var/lib/brain/awareness/github"
+      BRAIN_STATE_DIR: "/var/lib/brain/state"
+      USERDATA_DIR: "/var/lib/userdata"
+      MOUTH_HEADLINES_DIR: "/var/lib/mouth/headlines"
+      GITHUB_TRACKED_LOGINS: "${GITHUB_TRACKED_LOGINS:-wout,admin}"
+    flags: ["--once"]
+    status: implemented   # 2026-08-31
+
   - id: userdata-memory-bridge
     description: "Userdata memory bridge: read age-encrypted profiles, episodes, interests, hearsay from neohiro/userdata; write Brain entity projections. Bridges private-assistant canonical memory to Brain awareness."
     path: Heart/tools/memory_bridge_heart.py
@@ -199,11 +389,11 @@ scopes:
       USERDATA_IDENTITY_DIR: "/var/lib/userdata/identities"
       BRAIN_ENTITY_DIR: "/shared/brain/_entities"
       GODADMIN_IDENTITY: "${GODADMIN_IDENTITY:-}"
-    flags: ["--quiet", "--heart-mode"]
+    flags: ["--quiet"]
     status: implemented   # 2026-08-31
 
   - id: live-observer
-    description: "BRAIN_LIVE_OBSERVER.md: managed daemon that watches all org repos (discovered from Brain/_entities/org-*.md) and emits per-file change records to /shared/brain/watch/changes/. Daemon mode is restart-only; SIGTERM drains timers and removes the sentinel."
+    description: "BRAIN_LIVE_OBSERVER.md: scheduled run of live_observer_runner.py in --once mode (per-org initial scan + delta emit, then exit). Heart restarts the subprocess every 5 min so SIGTERM is not used in production; the SIGTERM path is exercised by tests and is the safety net for ad-hoc daemon mode."
     path: Heart/tools/live_observer_runner.py
     schedule: every_5_minutes
     timeout_seconds: 60
@@ -230,6 +420,26 @@ scopes:
       NEOHIRO_BRAIN_DEVICE_TOOLSET_PATH: "/brain/config/brain_device_toolset.yaml"
     flags: ["--once"]
     status: implemented   # 2026-08-31
+
+  - id: doctor-sync
+    description: >
+      Sync doctor.yml from neohiro/doctor to all org repos (neohiro, frenzypenguin-media,
+      openstageisland, transhumanists). Auto-detects protected branches and creates PRs
+      instead of direct pushes. Runs on schedule for periodic refresh + on dispatch for
+      manual trigger. Canonical tool: neohiro-doctor/tools/sync_doctor_workflow.py.
+      Protected repos use PR path: neohiro/Heart, neohiro.github.io, linux, windows,
+      ubuntu, worldmap, links-secret, frenzypenguin-media.github.io.
+    path: Heart/tools/doctor_sync_heart.py
+    schedule: every_24_hours
+    timeout_seconds: 600
+    retry_on_failure: true
+    max_retries: 1
+    fallback_github_actions: .github/workflows/doctor-sync-fallback.yml
+    env:
+      NEOHIRO_DOCTOR_ROOT: "/brain/neohiro-doctor"
+      NEOHIRO_GITHUB_TOKEN: "${GITHUB_TOKEN:-}"
+    flags: ["--org", "all", "--apply"]
+    status: implemented   # 2026-09-01
 
 # ── Channel-publishing scopes ────────────────────────────────────────────────
 # These scopes control how Mouth formats output for public-facing channels.

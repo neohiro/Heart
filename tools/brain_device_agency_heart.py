@@ -32,13 +32,14 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import subprocess
 import sys
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 _ROOT = Path(__file__).resolve().parent.parent.parent
 if str(_ROOT) not in sys.path:
@@ -69,6 +70,15 @@ def _get_brain_path() -> Path:
     return Path(os.environ.get("BRAIN_PATH", "/brain"))
 
 
+def _shared_root() -> Path:
+    """Return the shared storage root, matching the convention used by grounding.py."""
+    return Path(os.environ.get("NEOHIRO_SHARED_ROOT", "/shared"))
+
+
+# Cap reads to prevent memory exhaustion from a maliciously large feedback file.
+_MAX_FEEDBACK_READ_BYTES: int = 1_048_576  # 1 MiB
+
+
 # ── atomic write (reuse Heart/tools/atomic.py) ──────────────────────────────────
 
 def _write_yaml_atomic(path: Path, data: dict) -> None:
@@ -79,10 +89,12 @@ def _write_yaml_atomic(path: Path, data: dict) -> None:
 
 # ── feedback reader ─────────────────────────────────────────────────────────────
 
-def _read_feedback(path: Path) -> Optional[dict]:
+def _read_feedback(path: Path) -> dict | None:
     try:
+        raw_bytes = path.read_bytes()[:_MAX_FEEDBACK_READ_BYTES]
+        text = raw_bytes.decode("utf-8", errors="replace")
         import yaml
-        return yaml.safe_load(path.read_text(encoding="utf-8"))
+        return yaml.safe_load(text)
     except Exception:
         return None
 
@@ -116,28 +128,31 @@ def _run_retrospective(feedback: dict) -> dict:
     exit_code = trace.get("exit_code", -1)
 
     if action == "install_service":
-        package = trace.get("args", {}).get("package", "unknown")
+        args = trace.get("args")
+        package = args.get("package", "unknown") if isinstance(args, dict) else "unknown"
         if exit_code == 0:
             went_well.append(f"service_install: '{package}' completed successfully (exit 0)")
-            evidence.append(f"systemctl is-active {package}")
+            evidence.append(f"systemctl is-active {shlex.quote(str(package))}")
         else:
             didnt.append(f"service_install: '{package}' failed (exit {exit_code})")
-            evidence.append(f"journalctl -u {package} -n 20 --no-pager")
+            evidence.append(f"journalctl -u {shlex.quote(str(package))} -n 20 --no-pager")
 
     elif action == "linux_exec":
         cmd = trace.get("args", {}).get("command", "unknown")
         duration = trace.get("duration_ms", -1)
         if exit_code == 0 and 0 <= duration < 60_000:
             went_well.append(f"linux_exec completed in {duration}ms")
-            evidence.append(f"echo \"cmd: {cmd} (exit {exit_code})\"")
+            safe_cmd = shlex.quote(str(cmd))
+            evidence.append(f"echo 'cmd: {safe_cmd} (exit {exit_code})'")
 
     elif action == "gh_query":
         if exit_code == 0:
             went_well.append("gh_query returned successfully")
-            evidence.append(f"echo \"query: {trace.get('args', {}).get('query', 'unknown')}\"")
+            safe_query = shlex.quote(str(trace.get("args", {}).get("query", "unknown")))
+            evidence.append(f"echo 'query: {safe_query}'")
         else:
             didnt.append("gh_query failed")
-            evidence.append(f"echo \"exit: {exit_code}\"")
+            evidence.append(f"echo 'exit: {exit_code}'")
 
     # Always add role+login context
     evidence.append(f"echo 'actor: {login} @ role={role}, action={action}'")
@@ -151,11 +166,6 @@ def _run_retrospective(feedback: dict) -> dict:
         "what_didnt": didnt,
         "evidence": evidence,
     }
-
-
-def _shared_root() -> Path:
-    """Return the shared storage root, matching the convention used by grounding.py."""
-    return Path(os.environ.get("NEOHIRO_SHARED_ROOT", "/shared"))
 
 
 # ── introspection ─────────────────────────────────────────────────────────────
@@ -366,17 +376,11 @@ def _iso_now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def _feedback_id(feedback: dict) -> str:
-    ts = feedback.get("ts", "").replace(":", "-").replace(" ", "_")
-    login = feedback.get("login", "unknown")
-    return f"{ts}-{login}"
+def _processed_marker_from_path(fb_path: Path) -> Path:
+    return _get_feedback_dir() / f".{fb_path.stem}.processed"
 
 
-def _processed_marker(feedback_id: str) -> Path:
-    return _get_feedback_dir() / f".{feedback_id}.processed"
-
-
-def run_once(brain_path: Optional[Path] = None) -> dict[str, Any]:
+def run_once(brain_path: Path | None = None) -> dict[str, Any]:
     """
     Heart dispatcher entry point.
 
@@ -424,41 +428,30 @@ def run_once(brain_path: Optional[Path] = None) -> dict[str, Any]:
         log.warning("feedback_dir_unreadable", error=str(e))
         feedback_files = []
 
-    # First pass: count how many would be skipped due to the batch limit.
-    # This is informational only; we still process the first `batch_limit` files.
-    total_unprocessed = 0
+    # First pass: identify candidates + cache marker presence in a list.
+    # The list is used as the processing source in the second pass, so no
+    # marker re-statting occurs (was O(N²) syscalls, now O(N)).
+    unprocessed: list[Path] = []
     for fb_path in feedback_files:
         if fb_path.name.startswith("."):
             continue
-        if _processed_marker(fb_path.stem).is_file():
+        marker = _processed_marker_from_path(fb_path)
+        if marker.is_file():
             continue
-        total_unprocessed += 1
+        unprocessed.append(fb_path)
 
+    total_unprocessed = len(unprocessed)
     if total_unprocessed > batch_limit:
         skipped_over_limit = total_unprocessed - batch_limit
         log.info("retro_batch_limit", total=total_unprocessed, limit=batch_limit,
                  skipped=skipped_over_limit)
 
-    # Second pass: process at most `batch_limit` files.
+    # Second pass: process at most `batch_limit` files from the pre-filtered list.
     processed_this_run = 0
 
-    for fb_path in feedback_files:
-        feedback_id = fb_path.stem  # filename without .yaml
-
-        # Skip files that are themselves named with a leading dot (markers).
-        if fb_path.name.startswith("."):
-            continue
-
-        # Skip already-processed files.
-        marker = _processed_marker(feedback_id)
-        if marker.is_file():
-            continue
-
-        # Respect the batch limit so a large backlog doesn't lock the dispatcher.
-        # (The first pass already computed `skipped_over_limit = total_unprocessed - batch_limit`
-        #  so the remaining files are skipped without double-counting here.)
+    for fb_path in unprocessed:
         if processed_this_run >= batch_limit:
-            continue
+            break
 
         feedback = _read_feedback(fb_path)
         if feedback is None:
@@ -467,7 +460,7 @@ def run_once(brain_path: Optional[Path] = None) -> dict[str, Any]:
             continue
 
         action = feedback.get("action", "unknown")
-        fid = _feedback_id(feedback)
+        retro_id = fb_path.stem  # ts-login-hash (no .yaml), unique per file
 
         try:
             retro = _run_retrospective(feedback)
@@ -496,11 +489,11 @@ def run_once(brain_path: Optional[Path] = None) -> dict[str, Any]:
                     self_improvement_actions.append(f"investigate: {item}")
 
             # Write retro output.
-            retro_output_path = retro_dir / f"{fid}.yaml"
+            retro_output_path = retro_dir / f"{retro_id}.yaml"
             retro_output = {
                 "schema_version": 1,
                 "ts": _iso_now(),
-                "feedback_id": fid,
+                "feedback_id": retro_id,
                 "action": action,
                 "retrospective": retro,
                 "introspective": intro,
@@ -521,12 +514,12 @@ def run_once(brain_path: Optional[Path] = None) -> dict[str, Any]:
 
             # Mark as processed.
             try:
-                marker.write_text(_iso_now(), encoding="utf-8")
+                _processed_marker_from_path(fb_path).write_text(_iso_now(), encoding="utf-8")
             except OSError:
                 pass
 
             result = RetroResult(
-                feedback_id=fid,
+                feedback_id=retro_id,
                 action=action,
                 retrospective=retro,
                 introspective=intro,
@@ -538,14 +531,14 @@ def run_once(brain_path: Optional[Path] = None) -> dict[str, Any]:
             results.append(result)
             processed_count += 1
             processed_this_run += 1
-            log.info("retro_complete", feedback_id=fid, action=action,
+            log.info("retro_complete", feedback_id=retro_id, action=action,
                      doctor_called=doctor_called, godadmin_notified=godadmin_notified)
 
         except Exception as e:
             error_count += 1
-            log.error("retro_failed", feedback_id=fid, error=str(e))
+            log.error("retro_failed", feedback_id=retro_id, error=str(e))
             results.append(RetroResult(
-                feedback_id=fid,
+                feedback_id=retro_id,
                 action=action,
                 retrospective={},
                 introspective={},
@@ -590,7 +583,6 @@ if __name__ == "__main__":
         result = run_once()
         print(json.dumps(result, indent=2))
     else:
-        import time
         log.info("dispatcher_started", mode="continuous")
         while True:
             run_once()

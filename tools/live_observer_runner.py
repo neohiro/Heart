@@ -9,7 +9,11 @@ file so Heart and doctor can confirm the daemon is alive.
 Run:
     python Heart/tools/live_observer_runner.py           # daemon mode
     python Heart/tools/live_observer_runner.py --once    # scan once, emit, exit
-    python Heart/tools/live_observer_runner.py --roots neohiro:/neohiro   # override
+    python Heart/tools/live_observer_runner.py --roots neohiro-LLM:/repos/LLM   # override
+
+Note: scope names must match live_observer's regex (^[A-Za-z0-9_-]{1,64}$).
+"neohiro/LLM" is invalid; the runner maps "/" -> "-" so the discovered
+scopes (org-repofmt) are accepted by live_observer.
 
 Sentinel:
     /shared/brain/watch/observer.sentinel.json
@@ -135,7 +139,7 @@ def _sigterm_handler(signum: int, frame) -> None:
     _sentinel_remove()
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     import argparse
 
     parser = argparse.ArgumentParser(
@@ -158,7 +162,7 @@ def main() -> int:
         action="store_true",
         help="write sentinel and exit (checks if observer is already running)",
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     signal.signal(signal.SIGTERM, _sigterm_handler)
     signal.signal(signal.SIGINT, _sigterm_handler)
@@ -197,6 +201,18 @@ def main() -> int:
 
     global _observer_proc
     _observer_proc = proc
+    # Race: a dead-on-arrival observer would otherwise leave a misleading
+    # ok=True sentinel. Check immediately after launch — if the process
+    # already exited, report the failure and skip the sentinel write.
+    if proc.poll() is not None:
+        rc = proc.returncode
+        stderr = proc.stderr.read().decode("utf-8", errors="replace") if proc.stderr else ""
+        print(
+            f"[live_observer_runner] observer exited immediately with code {rc}"
+            + (f": {stderr.strip()}" if stderr.strip() else ""),
+            file=sys.stderr,
+        )
+        return rc if rc != 0 else 2
     _sentinel_write(proc.pid, {k: str(v) for k, v in roots.items()})
 
     if args.once:
