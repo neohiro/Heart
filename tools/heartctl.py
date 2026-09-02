@@ -200,6 +200,7 @@ def cmd_phase(args: argparse.Namespace) -> int:
             "ingest_news": _heart_module._phase_ingest_news,
             "ingest_content": _heart_module._phase_ingest_content,
             "ingest_osint": _heart_module._phase_ingest_osint,
+            "ingest_github_notifications": _heart_module._phase_ingest_github_notifications,
             "osint_userdata": _heart_module._phase_osint_userdata,
             "compute_health": _heart_module._phase_compute_health,
             "write_brain": _heart_module._phase_write_brain,

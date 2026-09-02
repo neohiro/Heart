@@ -230,30 +230,91 @@ if [ -n "$MOUTH_WEBHOOK" ] && command -v curl >/dev/null 2>&1; then
     fi
 fi
 
-# Critical: trigger GitHub Actions fallback workflow (sepsis protocol)
+# ── Sepsis protocol ──────────────────────────────────────────────────────────
+# The sepsis protocol has two phases:
+#   1. CRITICAL: switch execution to GitHub Actions (migration-controller force)
+#   2. RECOVERY: when heart recovers, switch back to cloud (migration-controller force)
+#
+# Tracking: we write /shared/_locks/.sepsis-state to remember the previous
+# escalation level so we can detect the CRITICAL→OK transition.
+
+SEPSIS_STATE_FILE="${HEART_DATA_PATH}/.sepsis-state"
+PREV_ESCALATE=0
+if [ -f "$SEPSIS_STATE_FILE" ]; then
+    PREV_ESCALATE=$(cat "$SEPSIS_STATE_FILE" 2>/dev/null || echo 0)
+fi
+
 if [ "$ESCALATE" -eq 2 ]; then
     critical "triggering sepsis protocol: GitHub Actions fallback"
+
+    # Step 1: switch execution layer to github_actions via migration-controller
+    if command -v python3 >/dev/null 2>&1 && [ -f "/bootstrap/migration-controller.py" ]; then
+        if python3 /bootstrap/migration-controller.py force github_actions 2>/dev/null; then
+            log "migration-controller: layer forced to github_actions"
+        else
+            warn "migration-controller force failed (continuing with GitHub API dispatch)"
+        fi
+    elif [ -f "/opt/neohiro/bootstrap/migration-controller.py" ]; then
+        python3 /opt/neohiro/bootstrap/migration-controller.py force github_actions 2>/dev/null \
+            || warn "migration-controller force failed"
+    fi
+
+    # Step 2: dispatch heart-remote-fallback.yml on GitHub
     if [ -n "$GH_ACTIONS_TOKEN" ] && command -v curl >/dev/null 2>&1; then
-        # Pass enough state to the fallback for context
+        # Resolve fallback workflow: prefer env override, else fall back to
+        # heart-remote-fallback.yml in the bootstrap repo on the same org.
+        FALLBACK_WF="${HEART_FALLBACK_WORKFLOW:-heart-remote-fallback.yml}"
+        if [ "$FALLBACK_WF" = "heart-remote-fallback.yml" ]; then
+            # Canonical location is neohiro/bootstrap; dispatch from there.
+            FALLBACK_REPO="${FALLBACK_REPO:-neohiro/bootstrap}"
+        else
+            FALLBACK_REPO="${GH_REPOSITORY}"
+        fi
+
         INPUTS_JSON=$(printf '{"ref":"main","inputs":{"reason":"%s","free_mb":"%d","heart_age_s":"%d","organ_failure":"true"}}' \
                       "$REASONS" "$FREE_MB" "$HEART_AGE_S")
-        GH_HTTP=$(curl -sS --max-time 10 \
+        GH_HTTP=$(curl -sS --max-time 15 \
             -o /dev/null -w "%{http_code}" \
             -X POST \
             -H "Authorization: token $GH_ACTIONS_TOKEN" \
             -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/$GH_REPOSITORY/actions/workflows/$HEART_FALLBACK_WORKFLOW/dispatches" \
+            -H "Content-Type: application/vnd.github+json" \
             -d "$INPUTS_JSON" \
+            "https://api.github.com/repos/${FALLBACK_REPO}/actions/workflows/${FALLBACK_WF}/dispatches" \
             2>/dev/null)
         GH_HTTP=${GH_HTTP:-NETERR}
-        if [ "$GH_HTTP" = "204" ]; then
-            log "sepsis protocol dispatched (HTTP $GH_HTTP)"
+        if [ "$GH_HTTP" = "204" ] || [ "$GH_HTTP" = "200" ]; then
+            log "sepsis: heart-remote-fallback.yml dispatched (HTTP $GH_HTTP)"
         else
-            warn "sepsis protocol dispatch failed (HTTP $GH_HTTP, expected 204)"
+            warn "sepsis: fallback dispatch failed (HTTP $GH_HTTP, expected 200/204)"
         fi
     else
-        warn "GH_ACTIONS_TOKEN unset or curl missing — sepsis protocol not dispatched"
+        warn "GH_ACTIONS_TOKEN unset or curl missing — sepsis API dispatch skipped"
+    fi
+
+# ── Recovery ────────────────────────────────────────────────────────────────
+# Detect CRITICAL → OK transition (cloud recovered after sepsis).
+elif [ "$ESCALATE" -eq 0 ] && [ "$PREV_ESCALATE" -eq 2 ]; then
+    log "sepsis recovery detected (prev=critical now=ok)"
+    if command -v python3 >/dev/null 2>&1; then
+        for ctl_path in \
+            "/bootstrap/migration-controller.py" \
+            "/opt/neohiro/bootstrap/migration-controller.py" \
+            "/shared/bootstrap/migration-controller.py"; do
+            if [ -f "$ctl_path" ]; then
+                if python3 "$ctl_path" recovery-check 2>/dev/null; then
+                    log "migration-controller: recovery confirmed; layer=cloud"
+                else
+                    python3 "$ctl_path" force cloud 2>/dev/null \
+                        || warn "migration-controller force cloud failed"
+                fi
+                break
+            fi
+        done
     fi
 fi
+
+# Persist current escalation level for recovery detection in the next run.
+echo "$ESCALATE" > "$SEPSIS_STATE_FILE"
 
 exit "$ESCALATE"

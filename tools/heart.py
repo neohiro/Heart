@@ -65,7 +65,6 @@ from pathlib import Path
 from typing import Any
 
 import structlog
-from atomic import write_text, write_yaml, write_yaml_multi_doc  # noqa: E402  (after _TOOLS_DIR path setup)
 
 # Ensure Heart/tools/ is on sys.path for sibling imports (e.g. abuse_bridge)
 _TOOLS_DIR = Path(__file__).resolve().parent
@@ -76,6 +75,8 @@ _WORKSPACE = _TOOLS_DIR.parent.parent
 for _p in (str(_WORKSPACE), str(_WORKSPACE / "userdata" / "src"), str(_WORKSPACE / "Brain" / "src")):
     if _p not in sys.path:
         sys.path.insert(0, _p)
+
+from atomic import write_text, write_yaml, write_yaml_multi_doc
 
 from Heart.tools import heart_shared_prune
 
@@ -1445,6 +1446,49 @@ def _phase_prune_shared(state: CycleState) -> PhaseResult:
     )
 
 
+def _phase_ingest_github_notifications(state: CycleState) -> PhaseResult:
+    """
+    Phase — ingest_github_notifications (per iot/SPEC_GITHUB_NOTIFICATIONS.md).
+
+    Drains /var/lib/iot/cache/github/ once per Heart cycle, routing each
+    event to:
+      - /var/lib/brain/awareness/github/<org>/<repo>.yaml (counters + log)
+      - /var/lib/userdata/users/<login>/notifications/<ts>.yaml.age (per-user,
+        age-encrypted via userdata.memory_bridge.write_notification)
+      - /var/lib/mouth/headlines/github.jsonl (one-line headlines)
+
+    This is the bridge that lets Brain take action on GitHub notices
+    (workflow failures, dependabot alerts, mentions, review requests).
+    Failures are non-fatal: the rest of the cycle continues.
+
+    Cadence: every cycle (small, idempotent).
+    """
+    t0 = time.monotonic()
+    error = ""
+    repos_touched = 0
+
+    if DRY_RUN:
+        elapsed = int((time.monotonic() - t0) * 1000)
+        return PhaseResult(name="ingest_github_notifications", ok=True, elapsed_ms=elapsed)
+
+    try:
+        from Heart.tools import github_notifications_heart as gh_bridge
+        counters = gh_bridge.run_once(dry_run=False, reset_processed=False, quiet=True)
+        repos_touched = int(counters.get("brain_updates", 0))
+    except Exception as e:
+        error = f"{type(e).__name__}: {e}"
+        log.warning("phase_ingest_github_notifications_error", error=error)
+
+    elapsed = int((time.monotonic() - t0) * 1000)
+    log.info("phase_ingest_github_notifications", elapsed_ms=elapsed, repos_touched=repos_touched)
+    return PhaseResult(
+        name="ingest_github_notifications",
+        ok=not error,
+        elapsed_ms=elapsed,
+        error=error,
+    )
+
+
 def _phase_grounding_audit(state: CycleState) -> PhaseResult:
     """
     Phase 17 — grounding_audit (per GROUNDING.md § 2).
@@ -1517,6 +1561,7 @@ def run_cycle(state: CycleState) -> CycleState:
         ("ingest_news", _phase_ingest_news),
         ("ingest_content", _phase_ingest_content),
         ("ingest_osint", _phase_ingest_osint),   # READ → AMEND → WRITE + enqueue signals
+        ("ingest_github_notifications", _phase_ingest_github_notifications),  # github webhook events → brain awareness + userdata + mouth
         ("ingest_visitors", _phase_ingest_visitors),  # visitor pings → ghost profiles + datalayer
         ("osint_userdata", _phase_osint_userdata),  # READ userdata summaries + resurrection detection; backup write-back on organ failure
         ("compute_health", _phase_compute_health),
